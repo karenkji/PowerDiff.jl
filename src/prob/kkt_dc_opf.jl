@@ -71,7 +71,8 @@ function _ensure_kkt_factor!(prob::DCOPFProblem)
     return prob.cache.kkt_factor
 end
 
-@inline _is_fixed_zero_shed(d::Real) = iszero(d)
+# Must match solve!'s snap tolerance so the canonicalized duals agree with the KKT system.
+@inline _is_fixed_zero_shed(d::Real) = abs(d) < COMPLEMENTARITY_SNAP_TOL
 
 # =============================================================================
 # Cached Derivative Computation Functions
