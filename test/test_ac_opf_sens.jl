@@ -232,4 +232,35 @@ using Test
         @test size(dpg_dsw) == (5, 7)
         @test size(dqg_dsw) == (5, 7)
     end
+
+    @testset "Manual KKT derivatives respect partial switching" begin
+        prob = ACOPFProblem(pm_data; silent=true)
+        sw = copy(prob.network.sw)
+        sw[3] = 0.5
+        sw[5] = 0.8
+        update_switching!(prob, sw)
+        sol = solve!(prob)
+        z = flatten_variables(sol, prob)
+
+        Jz = Matrix(calc_kkt_jacobian(prob; sol=sol))
+        Jz_fd = ForwardDiff.jacobian(zz -> kkt(zz, prob, sw), z)
+        @test maximum(abs.(Jz .- Jz_fd)) < 1e-7
+
+        Jsw = Matrix(PowerDiff.calc_kkt_jacobian_param(prob, sol, :sw))
+        Jsw_fd = ForwardDiff.jacobian(ss -> kkt(z, prob, ss), sw)
+        @test maximum(abs.(Jsw .- Jsw_fd)) < 1e-7
+    end
+
+    @testset "Single ∂K/∂sw column includes angle-limit terms" begin
+        pm_tight = deepcopy(pm_data)
+        pm_tight["branch"]["1"]["angmax"] = 0.05
+        prob = ACOPFProblem(pm_tight; silent=true)
+        sol = solve!(prob)
+
+        @test abs(sol.lam_angle_lb[1]) + abs(sol.lam_angle_ub[1]) > 1e-3
+
+        Jsw = Matrix(PowerDiff.calc_kkt_jacobian_param(prob, sol, :sw))
+        col = PowerDiff._calc_ac_kkt_param_column(prob, sol, :sw, 1)
+        @test maximum(abs.(Jsw[:, 1] .- col)) < 1e-7
+    end
 end

@@ -528,6 +528,7 @@ function _stationarity_residual!(K::AbstractVector, vars, prob::ACOPFProblem, sw
         prim = _branch_flow_primitives(vars.va, vars.vm, sw, constants, l)
         fb = prim.fb
         tb = prim.tb
+        sw_l = prim.sw
 
         coeff_p_fr = -vars.nu_p_bal[fb] - 2 * vars.lam_thermal_fr[l] * prim.p_fr -
                      vars.sig_p_fr_lb[l] - vars.sig_p_fr_ub[l]
@@ -538,16 +539,16 @@ function _stationarity_residual!(K::AbstractVector, vars, prob::ACOPFProblem, sw
         coeff_q_to = -vars.nu_q_bal[tb] - 2 * vars.lam_thermal_to[l] * prim.q_to -
                      vars.sig_q_to_lb[l] - vars.sig_q_to_ub[l]
 
-        K[idx.va[fb]] += coeff_p_fr * prim.dp_fr_hat[1] + coeff_q_fr * prim.dq_fr_hat[1] +
-                         coeff_p_to * prim.dp_to_hat[1] + coeff_q_to * prim.dq_to_hat[1] -
+        K[idx.va[fb]] += sw_l * (coeff_p_fr * prim.dp_fr_hat[1] + coeff_q_fr * prim.dq_fr_hat[1] +
+                                 coeff_p_to * prim.dp_to_hat[1] + coeff_q_to * prim.dq_to_hat[1]) -
                          prim.sw * (vars.lam_angle_lb[l] + vars.lam_angle_ub[l])
-        K[idx.va[tb]] += coeff_p_fr * prim.dp_fr_hat[2] + coeff_q_fr * prim.dq_fr_hat[2] +
-                         coeff_p_to * prim.dp_to_hat[2] + coeff_q_to * prim.dq_to_hat[2] +
+        K[idx.va[tb]] += sw_l * (coeff_p_fr * prim.dp_fr_hat[2] + coeff_q_fr * prim.dq_fr_hat[2] +
+                                 coeff_p_to * prim.dp_to_hat[2] + coeff_q_to * prim.dq_to_hat[2]) +
                          prim.sw * (vars.lam_angle_lb[l] + vars.lam_angle_ub[l])
-        K[idx.vm[fb]] += coeff_p_fr * prim.dp_fr_hat[3] + coeff_q_fr * prim.dq_fr_hat[3] +
-                         coeff_p_to * prim.dp_to_hat[3] + coeff_q_to * prim.dq_to_hat[3]
-        K[idx.vm[tb]] += coeff_p_fr * prim.dp_fr_hat[4] + coeff_q_fr * prim.dq_fr_hat[4] +
-                         coeff_p_to * prim.dp_to_hat[4] + coeff_q_to * prim.dq_to_hat[4]
+        K[idx.vm[fb]] += sw_l * (coeff_p_fr * prim.dp_fr_hat[3] + coeff_q_fr * prim.dq_fr_hat[3] +
+                                 coeff_p_to * prim.dp_to_hat[3] + coeff_q_to * prim.dq_to_hat[3])
+        K[idx.vm[tb]] += sw_l * (coeff_p_fr * prim.dp_fr_hat[4] + coeff_q_fr * prim.dq_fr_hat[4] +
+                                 coeff_p_to * prim.dp_to_hat[4] + coeff_q_to * prim.dq_to_hat[4])
     end
 
     return K
@@ -604,6 +605,7 @@ function calc_kkt_jacobian(prob::ACOPFProblem; sol::Union{ACOPFSolution,Nothing}
         prim = _branch_flow_primitives(vars.va, vars.vm, sw, constants, l)
         fb = prim.fb
         tb = prim.tb
+        sw_l = prim.sw
         local_idx = (idx.va[fb], idx.va[tb], idx.vm[fb], idx.vm[tb])
 
         coeff_p_fr = -vars.nu_p_bal[fb] - 2 * vars.lam_thermal_fr[l] * prim.p_fr -
@@ -615,27 +617,33 @@ function calc_kkt_jacobian(prob::ACOPFProblem; sol::Union{ACOPFSolution,Nothing}
         coeff_q_to = -vars.nu_q_bal[tb] - 2 * vars.lam_thermal_to[l] * prim.q_to -
                      vars.sig_q_to_lb[l] - vars.sig_q_to_ub[l]
 
-        _add_symmetric_local_hessian!(J, local_idx, prim.d2p_fr_hat, coeff_p_fr, -2 * vars.lam_thermal_fr[l], prim.dp_fr_hat)
-        _add_symmetric_local_hessian!(J, local_idx, prim.d2q_fr_hat, coeff_q_fr, -2 * vars.lam_thermal_fr[l], prim.dq_fr_hat)
-        _add_symmetric_local_hessian!(J, local_idx, prim.d2p_to_hat, coeff_p_to, -2 * vars.lam_thermal_to[l], prim.dp_to_hat)
-        _add_symmetric_local_hessian!(J, local_idx, prim.d2q_to_hat, coeff_q_to, -2 * vars.lam_thermal_to[l], prim.dq_to_hat)
+        _add_symmetric_local_hessian!(J, local_idx, prim.d2p_fr_hat, coeff_p_fr * sw_l,
+                                      -2 * vars.lam_thermal_fr[l] * sw_l^2, prim.dp_fr_hat)
+        _add_symmetric_local_hessian!(J, local_idx, prim.d2q_fr_hat, coeff_q_fr * sw_l,
+                                      -2 * vars.lam_thermal_fr[l] * sw_l^2, prim.dq_fr_hat)
+        _add_symmetric_local_hessian!(J, local_idx, prim.d2p_to_hat, coeff_p_to * sw_l,
+                                      -2 * vars.lam_thermal_to[l] * sw_l^2, prim.dp_to_hat)
+        _add_symmetric_local_hessian!(J, local_idx, prim.d2q_to_hat, coeff_q_to * sw_l,
+                                      -2 * vars.lam_thermal_to[l] * sw_l^2, prim.dq_to_hat)
 
         for t in 1:4
             row = local_idx[t]
-            J[row, idx.nu_p_bal[fb]] += -prim.dp_fr_hat[t]
-            J[row, idx.nu_q_bal[fb]] += -prim.dq_fr_hat[t]
-            J[row, idx.nu_p_bal[tb]] += -prim.dp_to_hat[t]
-            J[row, idx.nu_q_bal[tb]] += -prim.dq_to_hat[t]
-            J[row, idx.lam_thermal_fr[l]] += -2 * (prim.p_fr * prim.dp_fr_hat[t] + prim.q_fr * prim.dq_fr_hat[t])
-            J[row, idx.lam_thermal_to[l]] += -2 * (prim.p_to * prim.dp_to_hat[t] + prim.q_to * prim.dq_to_hat[t])
-            J[row, idx.sig_p_fr_lb[l]] += -prim.dp_fr_hat[t]
-            J[row, idx.sig_p_fr_ub[l]] += -prim.dp_fr_hat[t]
-            J[row, idx.sig_q_fr_lb[l]] += -prim.dq_fr_hat[t]
-            J[row, idx.sig_q_fr_ub[l]] += -prim.dq_fr_hat[t]
-            J[row, idx.sig_p_to_lb[l]] += -prim.dp_to_hat[t]
-            J[row, idx.sig_p_to_ub[l]] += -prim.dp_to_hat[t]
-            J[row, idx.sig_q_to_lb[l]] += -prim.dq_to_hat[t]
-            J[row, idx.sig_q_to_ub[l]] += -prim.dq_to_hat[t]
+            J[row, idx.nu_p_bal[fb]] += -sw_l * prim.dp_fr_hat[t]
+            J[row, idx.nu_q_bal[fb]] += -sw_l * prim.dq_fr_hat[t]
+            J[row, idx.nu_p_bal[tb]] += -sw_l * prim.dp_to_hat[t]
+            J[row, idx.nu_q_bal[tb]] += -sw_l * prim.dq_to_hat[t]
+            J[row, idx.lam_thermal_fr[l]] += -2 * sw_l *
+                                             (prim.p_fr * prim.dp_fr_hat[t] + prim.q_fr * prim.dq_fr_hat[t])
+            J[row, idx.lam_thermal_to[l]] += -2 * sw_l *
+                                             (prim.p_to * prim.dp_to_hat[t] + prim.q_to * prim.dq_to_hat[t])
+            J[row, idx.sig_p_fr_lb[l]] += -sw_l * prim.dp_fr_hat[t]
+            J[row, idx.sig_p_fr_ub[l]] += -sw_l * prim.dp_fr_hat[t]
+            J[row, idx.sig_q_fr_lb[l]] += -sw_l * prim.dq_fr_hat[t]
+            J[row, idx.sig_q_fr_ub[l]] += -sw_l * prim.dq_fr_hat[t]
+            J[row, idx.sig_p_to_lb[l]] += -sw_l * prim.dp_to_hat[t]
+            J[row, idx.sig_p_to_ub[l]] += -sw_l * prim.dp_to_hat[t]
+            J[row, idx.sig_q_to_lb[l]] += -sw_l * prim.dq_to_hat[t]
+            J[row, idx.sig_q_to_ub[l]] += -sw_l * prim.dq_to_hat[t]
         end
         J[idx.va[fb], idx.lam_angle_lb[l]] += -sw[l]
         J[idx.va[tb], idx.lam_angle_lb[l]] += sw[l]
@@ -644,22 +652,22 @@ function calc_kkt_jacobian(prob::ACOPFProblem; sol::Union{ACOPFSolution,Nothing}
 
         for t in 1:4
             col = local_idx[t]
-            J[idx.nu_p_bal[fb], col] += prim.dp_fr_hat[t]
-            J[idx.nu_q_bal[fb], col] += prim.dq_fr_hat[t]
-            J[idx.nu_p_bal[tb], col] += prim.dp_to_hat[t]
-            J[idx.nu_q_bal[tb], col] += prim.dq_to_hat[t]
-            J[idx.lam_thermal_fr[l], col] += vars.lam_thermal_fr[l] *
-                                             2 * (prim.p_fr * prim.dp_fr_hat[t] + prim.q_fr * prim.dq_fr_hat[t])
-            J[idx.lam_thermal_to[l], col] += vars.lam_thermal_to[l] *
-                                             2 * (prim.p_to * prim.dp_to_hat[t] + prim.q_to * prim.dq_to_hat[t])
-            J[idx.sig_p_fr_lb[l], col] += vars.sig_p_fr_lb[l] * prim.dp_fr_hat[t]
-            J[idx.sig_p_fr_ub[l], col] += -vars.sig_p_fr_ub[l] * prim.dp_fr_hat[t]
-            J[idx.sig_q_fr_lb[l], col] += vars.sig_q_fr_lb[l] * prim.dq_fr_hat[t]
-            J[idx.sig_q_fr_ub[l], col] += -vars.sig_q_fr_ub[l] * prim.dq_fr_hat[t]
-            J[idx.sig_p_to_lb[l], col] += vars.sig_p_to_lb[l] * prim.dp_to_hat[t]
-            J[idx.sig_p_to_ub[l], col] += -vars.sig_p_to_ub[l] * prim.dp_to_hat[t]
-            J[idx.sig_q_to_lb[l], col] += vars.sig_q_to_lb[l] * prim.dq_to_hat[t]
-            J[idx.sig_q_to_ub[l], col] += -vars.sig_q_to_ub[l] * prim.dq_to_hat[t]
+            J[idx.nu_p_bal[fb], col] += sw_l * prim.dp_fr_hat[t]
+            J[idx.nu_q_bal[fb], col] += sw_l * prim.dq_fr_hat[t]
+            J[idx.nu_p_bal[tb], col] += sw_l * prim.dp_to_hat[t]
+            J[idx.nu_q_bal[tb], col] += sw_l * prim.dq_to_hat[t]
+            J[idx.lam_thermal_fr[l], col] += vars.lam_thermal_fr[l] * 2 * sw_l *
+                                             (prim.p_fr * prim.dp_fr_hat[t] + prim.q_fr * prim.dq_fr_hat[t])
+            J[idx.lam_thermal_to[l], col] += vars.lam_thermal_to[l] * 2 * sw_l *
+                                             (prim.p_to * prim.dp_to_hat[t] + prim.q_to * prim.dq_to_hat[t])
+            J[idx.sig_p_fr_lb[l], col] += vars.sig_p_fr_lb[l] * sw_l * prim.dp_fr_hat[t]
+            J[idx.sig_p_fr_ub[l], col] += -vars.sig_p_fr_ub[l] * sw_l * prim.dp_fr_hat[t]
+            J[idx.sig_q_fr_lb[l], col] += vars.sig_q_fr_lb[l] * sw_l * prim.dq_fr_hat[t]
+            J[idx.sig_q_fr_ub[l], col] += -vars.sig_q_fr_ub[l] * sw_l * prim.dq_fr_hat[t]
+            J[idx.sig_p_to_lb[l], col] += vars.sig_p_to_lb[l] * sw_l * prim.dp_to_hat[t]
+            J[idx.sig_p_to_ub[l], col] += -vars.sig_p_to_ub[l] * sw_l * prim.dp_to_hat[t]
+            J[idx.sig_q_to_lb[l], col] += vars.sig_q_to_lb[l] * sw_l * prim.dq_to_hat[t]
+            J[idx.sig_q_to_ub[l], col] += -vars.sig_q_to_ub[l] * sw_l * prim.dq_to_hat[t]
         end
 
         J[idx.lam_angle_lb[l], idx.va[fb]] = vars.lam_angle_lb[l] * sw[l]
@@ -1285,22 +1293,8 @@ function _calc_ac_kkt_param_column(prob::ACOPFProblem, sol::ACOPFSolution, param
         coeff_q_to = -vars.nu_q_bal[tb] - 4 * vars.lam_thermal_to[col_idx] * prim.q_to -
                      vars.sig_q_to_lb[col_idx] - vars.sig_q_to_ub[col_idx]
 
-        Kcol[idx.va[fb]] += coeff_p_fr * prim.dp_fr_hat[1] +
-                            coeff_q_fr * prim.dq_fr_hat[1] +
-                            coeff_p_to * prim.dp_to_hat[1] +
-                            coeff_q_to * prim.dq_to_hat[1]
-        Kcol[idx.va[tb]] += coeff_p_fr * prim.dp_fr_hat[2] +
-                            coeff_q_fr * prim.dq_fr_hat[2] +
-                            coeff_p_to * prim.dp_to_hat[2] +
-                            coeff_q_to * prim.dq_to_hat[2]
-        Kcol[idx.vm[fb]] += coeff_p_fr * prim.dp_fr_hat[3] +
-                            coeff_q_fr * prim.dq_fr_hat[3] +
-                            coeff_p_to * prim.dp_to_hat[3] +
-                            coeff_q_to * prim.dq_to_hat[3]
-        Kcol[idx.vm[tb]] += coeff_p_fr * prim.dp_fr_hat[4] +
-                            coeff_q_fr * prim.dq_fr_hat[4] +
-                            coeff_p_to * prim.dp_to_hat[4] +
-                            coeff_q_to * prim.dq_to_hat[4]
+        _add_stationarity_sw_flow_terms!(
+            reshape(Kcol, :, 1), idx, vars, prim, 1, coeff_p_fr, coeff_q_fr, coeff_p_to, coeff_q_to)
 
         Kcol[idx.nu_p_bal[fb]] += prim.p_fr_hat
         Kcol[idx.nu_p_bal[tb]] += prim.p_to_hat
@@ -1320,6 +1314,12 @@ function _calc_ac_kkt_param_column(prob::ACOPFProblem, sol::ACOPFSolution, param
         Kcol[idx.sig_p_to_ub[col_idx]] = -vars.sig_p_to_ub[col_idx] * prim.p_to_hat
         Kcol[idx.sig_q_to_lb[col_idx]] = vars.sig_q_to_lb[col_idx] * prim.q_to_hat
         Kcol[idx.sig_q_to_ub[col_idx]] = -vars.sig_q_to_ub[col_idx] * prim.q_to_hat
+        Kcol[idx.va[fb]] += -(vars.lam_angle_lb[col_idx] + vars.lam_angle_ub[col_idx])
+        Kcol[idx.va[tb]] += vars.lam_angle_lb[col_idx] + vars.lam_angle_ub[col_idx]
+        Kcol[idx.lam_angle_lb[col_idx]] = vars.lam_angle_lb[col_idx] *
+                                          (vars.va[fb] - vars.va[tb] - constants.angmin[col_idx])
+        Kcol[idx.lam_angle_ub[col_idx]] = vars.lam_angle_ub[col_idx] *
+                                          (constants.angmax[col_idx] - vars.va[fb] + vars.va[tb])
         return Kcol
     end
 

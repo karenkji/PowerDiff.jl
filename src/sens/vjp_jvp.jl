@@ -385,7 +385,11 @@ function _ac_param_vjp!(out::AbstractVector, prob::ACOPFProblem, ctx, param::Sym
             u[idx.sig_p_to_lb[l]] * (sol.sig_p_to_lb[l] * prim.p_to_hat) +
             u[idx.sig_p_to_ub[l]] * (-sol.sig_p_to_ub[l] * prim.p_to_hat) +
             u[idx.sig_q_to_lb[l]] * (sol.sig_q_to_lb[l] * prim.q_to_hat) +
-            u[idx.sig_q_to_ub[l]] * (-sol.sig_q_to_ub[l] * prim.q_to_hat)
+            u[idx.sig_q_to_ub[l]] * (-sol.sig_q_to_ub[l] * prim.q_to_hat) +
+            u[idx.va[fb]] * (-(sol.lam_angle_lb[l] + sol.lam_angle_ub[l])) +
+            u[idx.va[tb]] * (sol.lam_angle_lb[l] + sol.lam_angle_ub[l]) +
+            u[idx.lam_angle_lb[l]] * (sol.lam_angle_lb[l] * (sol.va[fb] - sol.va[tb] - ctx.constants.angmin[l])) +
+            u[idx.lam_angle_ub[l]] * (sol.lam_angle_ub[l] * (ctx.constants.angmax[l] - sol.va[fb] + sol.va[tb]))
     end
     return out
 end
@@ -467,6 +471,10 @@ function _ac_param_jvp!(v::AbstractVector, prob::ACOPFProblem, ctx, param::Symbo
         v[idx.sig_p_to_ub[l]] += -t * sol.sig_p_to_ub[l] * prim.p_to_hat
         v[idx.sig_q_to_lb[l]] += t * sol.sig_q_to_lb[l] * prim.q_to_hat
         v[idx.sig_q_to_ub[l]] += -t * sol.sig_q_to_ub[l] * prim.q_to_hat
+        v[idx.va[fb]] += -t * (sol.lam_angle_lb[l] + sol.lam_angle_ub[l])
+        v[idx.va[tb]] += t * (sol.lam_angle_lb[l] + sol.lam_angle_ub[l])
+        v[idx.lam_angle_lb[l]] += t * sol.lam_angle_lb[l] * (sol.va[fb] - sol.va[tb] - ctx.constants.angmin[l])
+        v[idx.lam_angle_ub[l]] += t * sol.lam_angle_ub[l] * (ctx.constants.angmax[l] - sol.va[fb] + sol.va[tb])
     end
     return v
 end
