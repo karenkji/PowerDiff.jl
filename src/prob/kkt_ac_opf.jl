@@ -268,11 +268,15 @@ function _compute_branch_flows(va, vm, net::ACNetwork, ref, sw; constants=nothin
 end
 
 """
-Return branch-flow coefficients in the form
+Return local branch-flow coefficients.
 
-    F = sw * (a * s^2 + b * vm_f * vm_t * cos(δ) + c * vm_f * vm_t * sin(δ))
+Each tuple describes the unscaled polynomial
 
-with `δ = va_f - va_t`, for each of `p_fr`, `q_fr`, `p_to`, `q_to`.
+    F_hat = a * self_vm^2 + self_vm * other_vm * (b * cos(delta) + c * sin(delta))
+
+For from-side flows, `self_vm`/`other_vm` are `(vm_f, vm_t)`. For to-side
+flows, they are `(vm_t, vm_f)`. Multiplying `F_hat` by `sw[l]` gives the
+physical branch flow.
 """
 function _branch_flow_coefficients(constants, l::Int)
     g_br = constants.g_br[l]
@@ -309,112 +313,168 @@ function _branch_flow_coefficients(constants, l::Int)
     )
 end
 
-@inline function _branch_flow_base(coeffs, self_vm, other_vm, cosδ, sinδ)
-    return coeffs.a * self_vm^2 + self_vm * other_vm * (coeffs.b * cosδ + coeffs.c * sinδ)
+@inline function _branch_flow_base(coeffs, self_vm, other_vm, cos_delta, sin_delta)
+    return coeffs.a * self_vm^2 +
+           self_vm * other_vm * (coeffs.b * cos_delta + coeffs.c * sin_delta)
 end
 
-@inline function _branch_flow_local_partials(coeffs, self_vm, other_vm, cosδ, sinδ)
-    mix = coeffs.b * cosδ + coeffs.c * sinδ
-    dδ = self_vm * other_vm * (-coeffs.b * sinδ + coeffs.c * cosδ)
+@inline function _branch_flow_local_partials(coeffs, self_vm, other_vm,
+                                             cos_delta, sin_delta)
+    mix = coeffs.b * cos_delta + coeffs.c * sin_delta
+    d_delta = self_vm * other_vm * (-coeffs.b * sin_delta + coeffs.c * cos_delta)
     dself = 2 * coeffs.a * self_vm + other_vm * mix
     dother = self_vm * mix
-    return dδ, dself, dother
+    return d_delta, dself, dother
 end
 
-@inline function _branch_flow_local_second_partials(coeffs, self_vm, other_vm, cosδ, sinδ)
-    mix = coeffs.b * cosδ + coeffs.c * sinδ
-    dδδ = -self_vm * other_vm * mix
-    dδ_self = other_vm * (-coeffs.b * sinδ + coeffs.c * cosδ)
-    dδ_other = self_vm * (-coeffs.b * sinδ + coeffs.c * cosδ)
+@inline function _branch_flow_local_second_partials(coeffs, self_vm, other_vm,
+                                                    cos_delta, sin_delta)
+    mix = coeffs.b * cos_delta + coeffs.c * sin_delta
+    d_delta_delta = -self_vm * other_vm * mix
+    d_delta_self = other_vm * (-coeffs.b * sin_delta + coeffs.c * cos_delta)
+    d_delta_other = self_vm * (-coeffs.b * sin_delta + coeffs.c * cos_delta)
     dself_self = 2 * coeffs.a
     dself_other = mix
-    return dδδ, dδ_self, dδ_other, dself_self, dself_other
+    return d_delta_delta, d_delta_self, d_delta_other, dself_self, dself_other
 end
 
-@inline function _global_hessian_from_fr(dδδ, dδ_self, dδ_other, dself_self, dself_other)
+@inline function _global_hessian_from_fr(d_delta_delta, d_delta_self, d_delta_other,
+                                         dself_self, dself_other)
     return (
-        va_f_va_f = dδδ,
-        va_f_va_t = -dδδ,
-        va_f_vm_f = dδ_self,
-        va_f_vm_t = dδ_other,
-        va_t_va_t = dδδ,
-        va_t_vm_f = -dδ_self,
-        va_t_vm_t = -dδ_other,
+        va_f_va_f = d_delta_delta,
+        va_f_va_t = -d_delta_delta,
+        va_f_vm_f = d_delta_self,
+        va_f_vm_t = d_delta_other,
+        va_t_va_t = d_delta_delta,
+        va_t_vm_f = -d_delta_self,
+        va_t_vm_t = -d_delta_other,
         vm_f_vm_f = dself_self,
         vm_f_vm_t = dself_other,
         vm_t_vm_t = zero(dself_self),
     )
 end
 
-@inline function _global_hessian_from_to(dδδ, dδ_self, dδ_other, dself_self, dself_other)
+@inline function _global_hessian_from_to(d_delta_delta, d_delta_self, d_delta_other,
+                                         dself_self, dself_other)
     return (
-        va_f_va_f = dδδ,
-        va_f_va_t = -dδδ,
-        va_f_vm_f = dδ_other,
-        va_f_vm_t = dδ_self,
-        va_t_va_t = dδδ,
-        va_t_vm_f = -dδ_other,
-        va_t_vm_t = -dδ_self,
+        va_f_va_f = d_delta_delta,
+        va_f_va_t = -d_delta_delta,
+        va_f_vm_f = d_delta_other,
+        va_f_vm_t = d_delta_self,
+        va_t_va_t = d_delta_delta,
+        va_t_vm_f = -d_delta_other,
+        va_t_vm_t = -d_delta_self,
         vm_f_vm_f = zero(dself_self),
         vm_f_vm_t = dself_other,
         vm_t_vm_t = dself_self,
     )
 end
 
-"""
-Return branch-flow bases (with `sw = 1`) and local first derivatives with
-respect to `(va_f, va_t, vm_f, vm_t)`.
-"""
-function _branch_flow_primitives(va, vm, sw, constants, l::Int)
+@inline function _branch_flow_inputs(va, vm, sw, constants, l::Int)
     fb = constants.f_bus[l]
     tb = constants.t_bus[l]
     vf = vm[fb]
     vt = vm[tb]
-    δ = va[fb] - va[tb]
-    cosδ = cos(δ)
-    sinδ = sin(δ)
-    sw_l = sw[l]
-    coeffs = _branch_flow_coefficients(constants, l)
-
-    p_fr_hat = _branch_flow_base(coeffs.p_fr, vf, vt, cosδ, sinδ)
-    q_fr_hat = _branch_flow_base(coeffs.q_fr, vf, vt, cosδ, sinδ)
-    p_to_hat = _branch_flow_base(coeffs.p_to, vt, vf, cosδ, sinδ)
-    q_to_hat = _branch_flow_base(coeffs.q_to, vt, vf, cosδ, sinδ)
-
-    dp_fr_dδ_hat, dp_fr_dvf_hat, dp_fr_dvt_hat =
-        _branch_flow_local_partials(coeffs.p_fr, vf, vt, cosδ, sinδ)
-    dq_fr_dδ_hat, dq_fr_dvf_hat, dq_fr_dvt_hat =
-        _branch_flow_local_partials(coeffs.q_fr, vf, vt, cosδ, sinδ)
-    dp_to_dδ_hat, dp_to_dvt_hat, dp_to_dvf_hat =
-        _branch_flow_local_partials(coeffs.p_to, vt, vf, cosδ, sinδ)
-    dq_to_dδ_hat, dq_to_dvt_hat, dq_to_dvf_hat =
-        _branch_flow_local_partials(coeffs.q_to, vt, vf, cosδ, sinδ)
-
-    d2p_fr = _global_hessian_from_fr(
-        _branch_flow_local_second_partials(coeffs.p_fr, vf, vt, cosδ, sinδ)...)
-    d2q_fr = _global_hessian_from_fr(
-        _branch_flow_local_second_partials(coeffs.q_fr, vf, vt, cosδ, sinδ)...)
-    d2p_to = _global_hessian_from_to(
-        _branch_flow_local_second_partials(coeffs.p_to, vt, vf, cosδ, sinδ)...)
-    d2q_to = _global_hessian_from_to(
-        _branch_flow_local_second_partials(coeffs.q_to, vt, vf, cosδ, sinδ)...)
-
+    delta = va[fb] - va[tb]
     return (
         fb = fb,
         tb = tb,
-        sw = sw_l,
+        vf = vf,
+        vt = vt,
+        cos_delta = cos(delta),
+        sin_delta = sin(delta),
+        sw = sw[l],
+        coeffs = _branch_flow_coefficients(constants, l),
+    )
+end
+
+@inline function _branch_flow_values_from_inputs(data)
+    coeffs = data.coeffs
+    vf = data.vf
+    vt = data.vt
+    cos_delta = data.cos_delta
+    sin_delta = data.sin_delta
+
+    p_fr_hat = _branch_flow_base(coeffs.p_fr, vf, vt, cos_delta, sin_delta)
+    q_fr_hat = _branch_flow_base(coeffs.q_fr, vf, vt, cos_delta, sin_delta)
+    p_to_hat = _branch_flow_base(coeffs.p_to, vt, vf, cos_delta, sin_delta)
+    q_to_hat = _branch_flow_base(coeffs.q_to, vt, vf, cos_delta, sin_delta)
+
+    return (
+        fb = data.fb,
+        tb = data.tb,
+        sw = data.sw,
         p_fr_hat = p_fr_hat,
         q_fr_hat = q_fr_hat,
         p_to_hat = p_to_hat,
         q_to_hat = q_to_hat,
-        p_fr = sw_l * p_fr_hat,
-        q_fr = sw_l * q_fr_hat,
-        p_to = sw_l * p_to_hat,
-        q_to = sw_l * q_to_hat,
-        dp_fr_hat = (dp_fr_dδ_hat, -dp_fr_dδ_hat, dp_fr_dvf_hat, dp_fr_dvt_hat),
-        dq_fr_hat = (dq_fr_dδ_hat, -dq_fr_dδ_hat, dq_fr_dvf_hat, dq_fr_dvt_hat),
-        dp_to_hat = (dp_to_dδ_hat, -dp_to_dδ_hat, dp_to_dvf_hat, dp_to_dvt_hat),
-        dq_to_hat = (dq_to_dδ_hat, -dq_to_dδ_hat, dq_to_dvf_hat, dq_to_dvt_hat),
+        p_fr = data.sw * p_fr_hat,
+        q_fr = data.sw * q_fr_hat,
+        p_to = data.sw * p_to_hat,
+        q_to = data.sw * q_to_hat,
+    )
+end
+
+@inline function _branch_flow_gradient_partials(data)
+    coeffs = data.coeffs
+    vf = data.vf
+    vt = data.vt
+    cos_delta = data.cos_delta
+    sin_delta = data.sin_delta
+
+    dp_fr_delta_hat, dp_fr_dvf_hat, dp_fr_dvt_hat =
+        _branch_flow_local_partials(coeffs.p_fr, vf, vt, cos_delta, sin_delta)
+    dq_fr_delta_hat, dq_fr_dvf_hat, dq_fr_dvt_hat =
+        _branch_flow_local_partials(coeffs.q_fr, vf, vt, cos_delta, sin_delta)
+    dp_to_delta_hat, dp_to_dvt_hat, dp_to_dvf_hat =
+        _branch_flow_local_partials(coeffs.p_to, vt, vf, cos_delta, sin_delta)
+    dq_to_delta_hat, dq_to_dvt_hat, dq_to_dvf_hat =
+        _branch_flow_local_partials(coeffs.q_to, vt, vf, cos_delta, sin_delta)
+
+    return (
+        dp_fr_hat = (dp_fr_delta_hat, -dp_fr_delta_hat, dp_fr_dvf_hat, dp_fr_dvt_hat),
+        dq_fr_hat = (dq_fr_delta_hat, -dq_fr_delta_hat, dq_fr_dvf_hat, dq_fr_dvt_hat),
+        dp_to_hat = (dp_to_delta_hat, -dp_to_delta_hat, dp_to_dvf_hat, dp_to_dvt_hat),
+        dq_to_hat = (dq_to_delta_hat, -dq_to_delta_hat, dq_to_dvf_hat, dq_to_dvt_hat),
+    )
+end
+
+"""Return branch-flow values only."""
+function _branch_flow_values(va, vm, sw, constants, l::Int)
+    return _branch_flow_values_from_inputs(_branch_flow_inputs(va, vm, sw, constants, l))
+end
+
+"""Return branch-flow values and first derivatives with respect to local state."""
+function _branch_flow_gradients(va, vm, sw, constants, l::Int)
+    data = _branch_flow_inputs(va, vm, sw, constants, l)
+    vals = _branch_flow_values_from_inputs(data)
+    grads = _branch_flow_gradient_partials(data)
+    return (; vals..., grads...)
+end
+
+"""Return branch-flow values, first derivatives, and Hessian primitives."""
+function _branch_flow_hessian_primitives(va, vm, sw, constants, l::Int)
+    data = _branch_flow_inputs(va, vm, sw, constants, l)
+    vals = _branch_flow_values_from_inputs(data)
+    grads = _branch_flow_gradient_partials(data)
+    coeffs = data.coeffs
+    vf = data.vf
+    vt = data.vt
+    cos_delta = data.cos_delta
+    sin_delta = data.sin_delta
+
+    d2p_fr = _global_hessian_from_fr(
+        _branch_flow_local_second_partials(coeffs.p_fr, vf, vt, cos_delta, sin_delta)...)
+    d2q_fr = _global_hessian_from_fr(
+        _branch_flow_local_second_partials(coeffs.q_fr, vf, vt, cos_delta, sin_delta)...)
+    d2p_to = _global_hessian_from_to(
+        _branch_flow_local_second_partials(coeffs.p_to, vt, vf, cos_delta, sin_delta)...)
+    d2q_to = _global_hessian_from_to(
+        _branch_flow_local_second_partials(coeffs.q_to, vt, vf, cos_delta, sin_delta)...)
+
+    return (;
+        vals...,
+        grads...,
         d2p_fr_hat = d2p_fr,
         d2q_fr_hat = d2q_fr,
         d2p_to_hat = d2p_to,
@@ -475,26 +535,48 @@ function _power_balance_residuals(va, vm, pg, qg, p_fr, q_fr, p_to, q_to,
     return K_p_bal, K_q_bal
 end
 
-@inline function _add_symmetric_local_hessian!(J::AbstractMatrix, rows::NTuple{4,Int},
-                                               H, coeff, outer, grad::NTuple{4})
+@inline function _add_sparse_entry!(I::Vector{Int}, J::Vector{Int}, V::Vector{Float64},
+                                    row::Int, col::Int, val)
+    iszero(val) && return nothing
+    push!(I, row)
+    push!(J, col)
+    push!(V, Float64(val))
+    return nothing
+end
+
+@inline function _add_symmetric_local_hessian_entries!(
+    I::Vector{Int}, J::Vector{Int}, V::Vector{Float64},
+    rows::NTuple{4,Int}, H, coeff, outer, grad::NTuple{4})
     i1, i2, i3, i4 = rows
     g1, g2, g3, g4 = grad
-    J[i1, i1] += coeff * H.va_f_va_f + outer * g1 * g1
-    J[i1, i2] += coeff * H.va_f_va_t + outer * g1 * g2
-    J[i2, i1] = J[i1, i2]
-    J[i1, i3] += coeff * H.va_f_vm_f + outer * g1 * g3
-    J[i3, i1] = J[i1, i3]
-    J[i1, i4] += coeff * H.va_f_vm_t + outer * g1 * g4
-    J[i4, i1] = J[i1, i4]
-    J[i2, i2] += coeff * H.va_t_va_t + outer * g2 * g2
-    J[i2, i3] += coeff * H.va_t_vm_f + outer * g2 * g3
-    J[i3, i2] = J[i2, i3]
-    J[i2, i4] += coeff * H.va_t_vm_t + outer * g2 * g4
-    J[i4, i2] = J[i2, i4]
-    J[i3, i3] += coeff * H.vm_f_vm_f + outer * g3 * g3
-    J[i3, i4] += coeff * H.vm_f_vm_t + outer * g3 * g4
-    J[i4, i3] = J[i3, i4]
-    J[i4, i4] += coeff * H.vm_t_vm_t + outer * g4 * g4
+
+    v11 = coeff * H.va_f_va_f + outer * g1 * g1
+    v12 = coeff * H.va_f_va_t + outer * g1 * g2
+    v13 = coeff * H.va_f_vm_f + outer * g1 * g3
+    v14 = coeff * H.va_f_vm_t + outer * g1 * g4
+    v22 = coeff * H.va_t_va_t + outer * g2 * g2
+    v23 = coeff * H.va_t_vm_f + outer * g2 * g3
+    v24 = coeff * H.va_t_vm_t + outer * g2 * g4
+    v33 = coeff * H.vm_f_vm_f + outer * g3 * g3
+    v34 = coeff * H.vm_f_vm_t + outer * g3 * g4
+    v44 = coeff * H.vm_t_vm_t + outer * g4 * g4
+
+    _add_sparse_entry!(I, J, V, i1, i1, v11)
+    _add_sparse_entry!(I, J, V, i1, i2, v12)
+    _add_sparse_entry!(I, J, V, i2, i1, v12)
+    _add_sparse_entry!(I, J, V, i1, i3, v13)
+    _add_sparse_entry!(I, J, V, i3, i1, v13)
+    _add_sparse_entry!(I, J, V, i1, i4, v14)
+    _add_sparse_entry!(I, J, V, i4, i1, v14)
+    _add_sparse_entry!(I, J, V, i2, i2, v22)
+    _add_sparse_entry!(I, J, V, i2, i3, v23)
+    _add_sparse_entry!(I, J, V, i3, i2, v23)
+    _add_sparse_entry!(I, J, V, i2, i4, v24)
+    _add_sparse_entry!(I, J, V, i4, i2, v24)
+    _add_sparse_entry!(I, J, V, i3, i3, v33)
+    _add_sparse_entry!(I, J, V, i3, i4, v34)
+    _add_sparse_entry!(I, J, V, i4, i3, v34)
+    _add_sparse_entry!(I, J, V, i4, i4, v44)
     return nothing
 end
 
@@ -525,7 +607,7 @@ function _stationarity_residual!(K::AbstractVector, vars, prob::ACOPFProblem, sw
     end
 
     @inbounds for l in 1:m
-        prim = _branch_flow_primitives(vars.va, vars.vm, sw, constants, l)
+        prim = _branch_flow_gradients(vars.va, vars.vm, sw, constants, l)
         fb = prim.fb
         tb = prim.tb
         sw_l = prim.sw
@@ -568,41 +650,50 @@ function calc_kkt_jacobian(prob::ACOPFProblem; sol::Union{ACOPFSolution,Nothing}
     constants = _extract_kkt_constants(prob)
     prob.cache.kkt_constants = constants
     cq = _extract_gen_cq(prob)
-    cl = _extract_gen_cl(prob)
     fmax = _extract_branch_fmax(prob)
     sw = prob.network.sw
     vars = unflatten_variables(flatten_variables(sol, prob), idx)
     n, m, k = prob.network.n, prob.network.m, prob.n_gen
 
-    J = spzeros(Float64, kkt_dims(prob), kkt_dims(prob))
+    dim = kkt_dims(prob)
+    row_idxs = Int[]
+    col_idxs = Int[]
+    vals = Float64[]
+    nnz_hint = 32 * n + 180 * m + 12 * k + 2 * length(constants.ref_bus_keys)
+    sizehint!(row_idxs, nnz_hint)
+    sizehint!(col_idxs, nnz_hint)
+    sizehint!(vals, nnz_hint)
 
     @inbounds for i in 1:k
-        J[idx.pg[i], idx.pg[i]] = 2 * cq[i]
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.pg[i], idx.pg[i], 2 * cq[i])
     end
     @inbounds for i in 1:n
-        J[idx.vm[i], idx.vm[i]] += -2 * vars.nu_p_bal[i] * constants.gs[i] +
-                                   2 * vars.nu_q_bal[i] * constants.bs[i]
+        _add_sparse_entry!(
+            row_idxs, col_idxs, vals, idx.vm[i], idx.vm[i],
+            -2 * vars.nu_p_bal[i] * constants.gs[i] +
+            2 * vars.nu_q_bal[i] * constants.bs[i])
     end
 
     @inbounds for i in 1:k
         bus = constants.gen_bus[i]
-        J[idx.pg[i], idx.nu_p_bal[bus]] = 1.0
-        J[idx.pg[i], idx.rho_pg_lb[i]] = -1.0
-        J[idx.pg[i], idx.rho_pg_ub[i]] = -1.0
-        J[idx.qg[i], idx.nu_q_bal[bus]] = 1.0
-        J[idx.qg[i], idx.rho_qg_lb[i]] = -1.0
-        J[idx.qg[i], idx.rho_qg_ub[i]] = -1.0
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.pg[i], idx.nu_p_bal[bus], 1.0)
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.pg[i], idx.rho_pg_lb[i], -1.0)
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.pg[i], idx.rho_pg_ub[i], -1.0)
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.qg[i], idx.nu_q_bal[bus], 1.0)
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.qg[i], idx.rho_qg_lb[i], -1.0)
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.qg[i], idx.rho_qg_ub[i], -1.0)
     end
     @inbounds for i in 1:n
-        J[idx.vm[i], idx.mu_vm_lb[i]] = -1.0
-        J[idx.vm[i], idx.mu_vm_ub[i]] = -1.0
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.vm[i], idx.mu_vm_lb[i], -1.0)
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.vm[i], idx.mu_vm_ub[i], -1.0)
     end
     @inbounds for (j, ref_bus_idx) in enumerate(constants.ref_bus_keys)
-        J[idx.va[ref_bus_idx], idx.nu_ref_bus[j]] = -1.0
+        _add_sparse_entry!(
+            row_idxs, col_idxs, vals, idx.va[ref_bus_idx], idx.nu_ref_bus[j], -1.0)
     end
 
     @inbounds for l in 1:m
-        prim = _branch_flow_primitives(vars.va, vars.vm, sw, constants, l)
+        prim = _branch_flow_hessian_primitives(vars.va, vars.vm, sw, constants, l)
         fb = prim.fb
         tb = prim.tb
         sw_l = prim.sw
@@ -617,107 +708,184 @@ function calc_kkt_jacobian(prob::ACOPFProblem; sol::Union{ACOPFSolution,Nothing}
         coeff_q_to = -vars.nu_q_bal[tb] - 2 * vars.lam_thermal_to[l] * prim.q_to -
                      vars.sig_q_to_lb[l] - vars.sig_q_to_ub[l]
 
-        _add_symmetric_local_hessian!(J, local_idx, prim.d2p_fr_hat, coeff_p_fr * sw_l,
-                                      -2 * vars.lam_thermal_fr[l] * sw_l^2, prim.dp_fr_hat)
-        _add_symmetric_local_hessian!(J, local_idx, prim.d2q_fr_hat, coeff_q_fr * sw_l,
-                                      -2 * vars.lam_thermal_fr[l] * sw_l^2, prim.dq_fr_hat)
-        _add_symmetric_local_hessian!(J, local_idx, prim.d2p_to_hat, coeff_p_to * sw_l,
-                                      -2 * vars.lam_thermal_to[l] * sw_l^2, prim.dp_to_hat)
-        _add_symmetric_local_hessian!(J, local_idx, prim.d2q_to_hat, coeff_q_to * sw_l,
-                                      -2 * vars.lam_thermal_to[l] * sw_l^2, prim.dq_to_hat)
+        _add_symmetric_local_hessian_entries!(
+            row_idxs, col_idxs, vals, local_idx, prim.d2p_fr_hat, coeff_p_fr * sw_l,
+            -2 * vars.lam_thermal_fr[l] * sw_l^2, prim.dp_fr_hat)
+        _add_symmetric_local_hessian_entries!(
+            row_idxs, col_idxs, vals, local_idx, prim.d2q_fr_hat, coeff_q_fr * sw_l,
+            -2 * vars.lam_thermal_fr[l] * sw_l^2, prim.dq_fr_hat)
+        _add_symmetric_local_hessian_entries!(
+            row_idxs, col_idxs, vals, local_idx, prim.d2p_to_hat, coeff_p_to * sw_l,
+            -2 * vars.lam_thermal_to[l] * sw_l^2, prim.dp_to_hat)
+        _add_symmetric_local_hessian_entries!(
+            row_idxs, col_idxs, vals, local_idx, prim.d2q_to_hat, coeff_q_to * sw_l,
+            -2 * vars.lam_thermal_to[l] * sw_l^2, prim.dq_to_hat)
 
         for t in 1:4
             row = local_idx[t]
-            J[row, idx.nu_p_bal[fb]] += -sw_l * prim.dp_fr_hat[t]
-            J[row, idx.nu_q_bal[fb]] += -sw_l * prim.dq_fr_hat[t]
-            J[row, idx.nu_p_bal[tb]] += -sw_l * prim.dp_to_hat[t]
-            J[row, idx.nu_q_bal[tb]] += -sw_l * prim.dq_to_hat[t]
-            J[row, idx.lam_thermal_fr[l]] += -2 * sw_l *
-                                             (prim.p_fr * prim.dp_fr_hat[t] + prim.q_fr * prim.dq_fr_hat[t])
-            J[row, idx.lam_thermal_to[l]] += -2 * sw_l *
-                                             (prim.p_to * prim.dp_to_hat[t] + prim.q_to * prim.dq_to_hat[t])
-            J[row, idx.sig_p_fr_lb[l]] += -sw_l * prim.dp_fr_hat[t]
-            J[row, idx.sig_p_fr_ub[l]] += -sw_l * prim.dp_fr_hat[t]
-            J[row, idx.sig_q_fr_lb[l]] += -sw_l * prim.dq_fr_hat[t]
-            J[row, idx.sig_q_fr_ub[l]] += -sw_l * prim.dq_fr_hat[t]
-            J[row, idx.sig_p_to_lb[l]] += -sw_l * prim.dp_to_hat[t]
-            J[row, idx.sig_p_to_ub[l]] += -sw_l * prim.dp_to_hat[t]
-            J[row, idx.sig_q_to_lb[l]] += -sw_l * prim.dq_to_hat[t]
-            J[row, idx.sig_q_to_ub[l]] += -sw_l * prim.dq_to_hat[t]
+            _add_sparse_entry!(row_idxs, col_idxs, vals, row, idx.nu_p_bal[fb],
+                               -sw_l * prim.dp_fr_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, row, idx.nu_q_bal[fb],
+                               -sw_l * prim.dq_fr_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, row, idx.nu_p_bal[tb],
+                               -sw_l * prim.dp_to_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, row, idx.nu_q_bal[tb],
+                               -sw_l * prim.dq_to_hat[t])
+            _add_sparse_entry!(
+                row_idxs, col_idxs, vals, row, idx.lam_thermal_fr[l],
+                -2 * sw_l * (prim.p_fr * prim.dp_fr_hat[t] +
+                              prim.q_fr * prim.dq_fr_hat[t]))
+            _add_sparse_entry!(
+                row_idxs, col_idxs, vals, row, idx.lam_thermal_to[l],
+                -2 * sw_l * (prim.p_to * prim.dp_to_hat[t] +
+                              prim.q_to * prim.dq_to_hat[t]))
+            _add_sparse_entry!(row_idxs, col_idxs, vals, row, idx.sig_p_fr_lb[l],
+                               -sw_l * prim.dp_fr_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, row, idx.sig_p_fr_ub[l],
+                               -sw_l * prim.dp_fr_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, row, idx.sig_q_fr_lb[l],
+                               -sw_l * prim.dq_fr_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, row, idx.sig_q_fr_ub[l],
+                               -sw_l * prim.dq_fr_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, row, idx.sig_p_to_lb[l],
+                               -sw_l * prim.dp_to_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, row, idx.sig_p_to_ub[l],
+                               -sw_l * prim.dp_to_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, row, idx.sig_q_to_lb[l],
+                               -sw_l * prim.dq_to_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, row, idx.sig_q_to_ub[l],
+                               -sw_l * prim.dq_to_hat[t])
         end
-        J[idx.va[fb], idx.lam_angle_lb[l]] += -sw[l]
-        J[idx.va[tb], idx.lam_angle_lb[l]] += sw[l]
-        J[idx.va[fb], idx.lam_angle_ub[l]] += -sw[l]
-        J[idx.va[tb], idx.lam_angle_ub[l]] += sw[l]
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.va[fb], idx.lam_angle_lb[l],
+                           -sw[l])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.va[tb], idx.lam_angle_lb[l],
+                           sw[l])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.va[fb], idx.lam_angle_ub[l],
+                           -sw[l])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.va[tb], idx.lam_angle_ub[l],
+                           sw[l])
 
         for t in 1:4
             col = local_idx[t]
-            J[idx.nu_p_bal[fb], col] += sw_l * prim.dp_fr_hat[t]
-            J[idx.nu_q_bal[fb], col] += sw_l * prim.dq_fr_hat[t]
-            J[idx.nu_p_bal[tb], col] += sw_l * prim.dp_to_hat[t]
-            J[idx.nu_q_bal[tb], col] += sw_l * prim.dq_to_hat[t]
-            J[idx.lam_thermal_fr[l], col] += vars.lam_thermal_fr[l] * 2 * sw_l *
-                                             (prim.p_fr * prim.dp_fr_hat[t] + prim.q_fr * prim.dq_fr_hat[t])
-            J[idx.lam_thermal_to[l], col] += vars.lam_thermal_to[l] * 2 * sw_l *
-                                             (prim.p_to * prim.dp_to_hat[t] + prim.q_to * prim.dq_to_hat[t])
-            J[idx.sig_p_fr_lb[l], col] += vars.sig_p_fr_lb[l] * sw_l * prim.dp_fr_hat[t]
-            J[idx.sig_p_fr_ub[l], col] += -vars.sig_p_fr_ub[l] * sw_l * prim.dp_fr_hat[t]
-            J[idx.sig_q_fr_lb[l], col] += vars.sig_q_fr_lb[l] * sw_l * prim.dq_fr_hat[t]
-            J[idx.sig_q_fr_ub[l], col] += -vars.sig_q_fr_ub[l] * sw_l * prim.dq_fr_hat[t]
-            J[idx.sig_p_to_lb[l], col] += vars.sig_p_to_lb[l] * sw_l * prim.dp_to_hat[t]
-            J[idx.sig_p_to_ub[l], col] += -vars.sig_p_to_ub[l] * sw_l * prim.dp_to_hat[t]
-            J[idx.sig_q_to_lb[l], col] += vars.sig_q_to_lb[l] * sw_l * prim.dq_to_hat[t]
-            J[idx.sig_q_to_ub[l], col] += -vars.sig_q_to_ub[l] * sw_l * prim.dq_to_hat[t]
+            _add_sparse_entry!(row_idxs, col_idxs, vals, idx.nu_p_bal[fb], col,
+                               sw_l * prim.dp_fr_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, idx.nu_q_bal[fb], col,
+                               sw_l * prim.dq_fr_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, idx.nu_p_bal[tb], col,
+                               sw_l * prim.dp_to_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, idx.nu_q_bal[tb], col,
+                               sw_l * prim.dq_to_hat[t])
+            _add_sparse_entry!(
+                row_idxs, col_idxs, vals, idx.lam_thermal_fr[l], col,
+                vars.lam_thermal_fr[l] * 2 * sw_l *
+                (prim.p_fr * prim.dp_fr_hat[t] + prim.q_fr * prim.dq_fr_hat[t]))
+            _add_sparse_entry!(
+                row_idxs, col_idxs, vals, idx.lam_thermal_to[l], col,
+                vars.lam_thermal_to[l] * 2 * sw_l *
+                (prim.p_to * prim.dp_to_hat[t] + prim.q_to * prim.dq_to_hat[t]))
+            _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_p_fr_lb[l], col,
+                               vars.sig_p_fr_lb[l] * sw_l * prim.dp_fr_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_p_fr_ub[l], col,
+                               -vars.sig_p_fr_ub[l] * sw_l * prim.dp_fr_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_q_fr_lb[l], col,
+                               vars.sig_q_fr_lb[l] * sw_l * prim.dq_fr_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_q_fr_ub[l], col,
+                               -vars.sig_q_fr_ub[l] * sw_l * prim.dq_fr_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_p_to_lb[l], col,
+                               vars.sig_p_to_lb[l] * sw_l * prim.dp_to_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_p_to_ub[l], col,
+                               -vars.sig_p_to_ub[l] * sw_l * prim.dp_to_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_q_to_lb[l], col,
+                               vars.sig_q_to_lb[l] * sw_l * prim.dq_to_hat[t])
+            _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_q_to_ub[l], col,
+                               -vars.sig_q_to_ub[l] * sw_l * prim.dq_to_hat[t])
         end
 
-        J[idx.lam_angle_lb[l], idx.va[fb]] = vars.lam_angle_lb[l] * sw[l]
-        J[idx.lam_angle_lb[l], idx.va[tb]] = -vars.lam_angle_lb[l] * sw[l]
-        J[idx.lam_angle_lb[l], idx.lam_angle_lb[l]] = sw[l] * (vars.va[fb] - vars.va[tb] - constants.angmin[l])
-        J[idx.lam_angle_ub[l], idx.va[fb]] = -vars.lam_angle_ub[l] * sw[l]
-        J[idx.lam_angle_ub[l], idx.va[tb]] = vars.lam_angle_ub[l] * sw[l]
-        J[idx.lam_angle_ub[l], idx.lam_angle_ub[l]] = sw[l] * (constants.angmax[l] - vars.va[fb] + vars.va[tb])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.lam_angle_lb[l], idx.va[fb],
+                           vars.lam_angle_lb[l] * sw[l])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.lam_angle_lb[l], idx.va[tb],
+                           -vars.lam_angle_lb[l] * sw[l])
+        _add_sparse_entry!(
+            row_idxs, col_idxs, vals, idx.lam_angle_lb[l], idx.lam_angle_lb[l],
+            sw[l] * (vars.va[fb] - vars.va[tb] - constants.angmin[l]))
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.lam_angle_ub[l], idx.va[fb],
+                           -vars.lam_angle_ub[l] * sw[l])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.lam_angle_ub[l], idx.va[tb],
+                           vars.lam_angle_ub[l] * sw[l])
+        _add_sparse_entry!(
+            row_idxs, col_idxs, vals, idx.lam_angle_ub[l], idx.lam_angle_ub[l],
+            sw[l] * (constants.angmax[l] - vars.va[fb] + vars.va[tb]))
 
-        J[idx.lam_thermal_fr[l], idx.lam_thermal_fr[l]] = prim.p_fr^2 + prim.q_fr^2 - fmax[l]^2
-        J[idx.lam_thermal_to[l], idx.lam_thermal_to[l]] = prim.p_to^2 + prim.q_to^2 - fmax[l]^2
+        _add_sparse_entry!(
+            row_idxs, col_idxs, vals, idx.lam_thermal_fr[l], idx.lam_thermal_fr[l],
+            prim.p_fr^2 + prim.q_fr^2 - fmax[l]^2)
+        _add_sparse_entry!(
+            row_idxs, col_idxs, vals, idx.lam_thermal_to[l], idx.lam_thermal_to[l],
+            prim.p_to^2 + prim.q_to^2 - fmax[l]^2)
     end
 
     @inbounds for i in 1:n
-        J[idx.nu_p_bal[i], idx.vm[i]] += 2 * constants.gs[i] * vars.vm[i]
-        J[idx.nu_q_bal[i], idx.vm[i]] += -2 * constants.bs[i] * vars.vm[i]
-        J[idx.mu_vm_lb[i], idx.vm[i]] = vars.mu_vm_lb[i]
-        J[idx.mu_vm_lb[i], idx.mu_vm_lb[i]] = vars.vm[i] - constants.vmin[i]
-        J[idx.mu_vm_ub[i], idx.vm[i]] = -vars.mu_vm_ub[i]
-        J[idx.mu_vm_ub[i], idx.mu_vm_ub[i]] = constants.vmax[i] - vars.vm[i]
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.nu_p_bal[i], idx.vm[i],
+                           2 * constants.gs[i] * vars.vm[i])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.nu_q_bal[i], idx.vm[i],
+                           -2 * constants.bs[i] * vars.vm[i])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.mu_vm_lb[i], idx.vm[i],
+                           vars.mu_vm_lb[i])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.mu_vm_lb[i], idx.mu_vm_lb[i],
+                           vars.vm[i] - constants.vmin[i])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.mu_vm_ub[i], idx.vm[i],
+                           -vars.mu_vm_ub[i])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.mu_vm_ub[i], idx.mu_vm_ub[i],
+                           constants.vmax[i] - vars.vm[i])
     end
     @inbounds for (j, ref_bus_idx) in enumerate(constants.ref_bus_keys)
-        J[idx.nu_ref_bus[j], idx.va[ref_bus_idx]] = 1.0
+        _add_sparse_entry!(
+            row_idxs, col_idxs, vals, idx.nu_ref_bus[j], idx.va[ref_bus_idx], 1.0)
     end
     @inbounds for i in 1:k
-        J[idx.nu_p_bal[constants.gen_bus[i]], idx.pg[i]] += -1.0
-        J[idx.nu_q_bal[constants.gen_bus[i]], idx.qg[i]] += -1.0
-        J[idx.rho_pg_lb[i], idx.pg[i]] = vars.rho_pg_lb[i]
-        J[idx.rho_pg_lb[i], idx.rho_pg_lb[i]] = vars.pg[i] - constants.pmin[i]
-        J[idx.rho_pg_ub[i], idx.pg[i]] = -vars.rho_pg_ub[i]
-        J[idx.rho_pg_ub[i], idx.rho_pg_ub[i]] = constants.pmax[i] - vars.pg[i]
-        J[idx.rho_qg_lb[i], idx.qg[i]] = vars.rho_qg_lb[i]
-        J[idx.rho_qg_lb[i], idx.rho_qg_lb[i]] = vars.qg[i] - constants.qmin[i]
-        J[idx.rho_qg_ub[i], idx.qg[i]] = -vars.rho_qg_ub[i]
-        J[idx.rho_qg_ub[i], idx.rho_qg_ub[i]] = constants.qmax[i] - vars.qg[i]
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.nu_p_bal[constants.gen_bus[i]],
+                           idx.pg[i], -1.0)
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.nu_q_bal[constants.gen_bus[i]],
+                           idx.qg[i], -1.0)
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.rho_pg_lb[i], idx.pg[i],
+                           vars.rho_pg_lb[i])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.rho_pg_lb[i], idx.rho_pg_lb[i],
+                           vars.pg[i] - constants.pmin[i])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.rho_pg_ub[i], idx.pg[i],
+                           -vars.rho_pg_ub[i])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.rho_pg_ub[i], idx.rho_pg_ub[i],
+                           constants.pmax[i] - vars.pg[i])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.rho_qg_lb[i], idx.qg[i],
+                           vars.rho_qg_lb[i])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.rho_qg_lb[i], idx.rho_qg_lb[i],
+                           vars.qg[i] - constants.qmin[i])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.rho_qg_ub[i], idx.qg[i],
+                           -vars.rho_qg_ub[i])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.rho_qg_ub[i], idx.rho_qg_ub[i],
+                           constants.qmax[i] - vars.qg[i])
     end
 
     @inbounds for l in 1:m
-        prim = _branch_flow_primitives(vars.va, vars.vm, sw, constants, l)
-        J[idx.sig_p_fr_lb[l], idx.sig_p_fr_lb[l]] = prim.p_fr + fmax[l]
-        J[idx.sig_p_fr_ub[l], idx.sig_p_fr_ub[l]] = fmax[l] - prim.p_fr
-        J[idx.sig_q_fr_lb[l], idx.sig_q_fr_lb[l]] = prim.q_fr + fmax[l]
-        J[idx.sig_q_fr_ub[l], idx.sig_q_fr_ub[l]] = fmax[l] - prim.q_fr
-        J[idx.sig_p_to_lb[l], idx.sig_p_to_lb[l]] = prim.p_to + fmax[l]
-        J[idx.sig_p_to_ub[l], idx.sig_p_to_ub[l]] = fmax[l] - prim.p_to
-        J[idx.sig_q_to_lb[l], idx.sig_q_to_lb[l]] = prim.q_to + fmax[l]
-        J[idx.sig_q_to_ub[l], idx.sig_q_to_ub[l]] = fmax[l] - prim.q_to
+        prim = _branch_flow_values(vars.va, vars.vm, sw, constants, l)
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_p_fr_lb[l],
+                           idx.sig_p_fr_lb[l], prim.p_fr + fmax[l])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_p_fr_ub[l],
+                           idx.sig_p_fr_ub[l], fmax[l] - prim.p_fr)
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_q_fr_lb[l],
+                           idx.sig_q_fr_lb[l], prim.q_fr + fmax[l])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_q_fr_ub[l],
+                           idx.sig_q_fr_ub[l], fmax[l] - prim.q_fr)
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_p_to_lb[l],
+                           idx.sig_p_to_lb[l], prim.p_to + fmax[l])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_p_to_ub[l],
+                           idx.sig_p_to_ub[l], fmax[l] - prim.p_to)
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_q_to_lb[l],
+                           idx.sig_q_to_lb[l], prim.q_to + fmax[l])
+        _add_sparse_entry!(row_idxs, col_idxs, vals, idx.sig_q_to_ub[l],
+                           idx.sig_q_to_ub[l], fmax[l] - prim.q_to)
     end
 
-    return J
+    return sparse(row_idxs, col_idxs, vals, dim, dim)
 end
 
 # =============================================================================
@@ -875,7 +1043,12 @@ function _extract_bus_load(prob::ACOPFProblem, key::String)
     return vals
 end
 
-"""Extract per-generator cost coefficient at a given index (1=quadratic, 2=linear)."""
+"""
+Extract per-generator cost coefficient at a given index (1=quadratic, 2=linear).
+
+AC OPF construction runs PowerModels cost standardization before this point, so
+the analytical path assumes finite numeric coefficients.
+"""
 function _extract_gen_cost(prob::ACOPFProblem, cost_idx::Int)
     k = prob.n_gen
     vals = zeros(k)
@@ -890,7 +1063,12 @@ _extract_bus_qd(prob::ACOPFProblem) = _extract_bus_load(prob, "qd")
 _extract_gen_cq(prob::ACOPFProblem) = _extract_gen_cost(prob, 1)
 _extract_gen_cl(prob::ACOPFProblem) = _extract_gen_cost(prob, 2)
 
-"""Extract per-branch flow limits (rate_a) from the problem's ref."""
+"""
+Extract per-branch flow limits (`rate_a`) from the problem's ref.
+
+AC OPF construction runs PowerModels thermal-limit preprocessing before this
+point, so the analytical path assumes finite numeric limits.
+"""
 function _extract_branch_fmax(prob::ACOPFProblem)
     m = prob.network.m
     fmax = zeros(m)
@@ -975,82 +1153,92 @@ const _AC_PARAM_EXTRACT = Dict{Symbol, Function}(
     :fmax => _extract_branch_fmax,
 )
 
-@inline function _add_stationarity_sw_flow_terms!(
-    Jp::AbstractMatrix, idx::NamedTuple, vars, prim, l::Int,
-    coeff_p_fr, coeff_q_fr, coeff_p_to, coeff_q_to)
+@inline function _ac_sw_param_column_terms(idx::NamedTuple, vars, constants, prim, l::Int)
     fb = prim.fb
     tb = prim.tb
 
-    @inbounds begin
-        Jp[idx.va[fb], l] += coeff_p_fr * prim.dp_fr_hat[1] +
-                             coeff_q_fr * prim.dq_fr_hat[1] +
-                             coeff_p_to * prim.dp_to_hat[1] +
-                             coeff_q_to * prim.dq_to_hat[1]
-        Jp[idx.va[tb], l] += coeff_p_fr * prim.dp_fr_hat[2] +
-                             coeff_q_fr * prim.dq_fr_hat[2] +
-                             coeff_p_to * prim.dp_to_hat[2] +
-                             coeff_q_to * prim.dq_to_hat[2]
+    coeff_p_fr = -vars.nu_p_bal[fb] - 4 * vars.lam_thermal_fr[l] * prim.p_fr -
+                 vars.sig_p_fr_lb[l] - vars.sig_p_fr_ub[l]
+    coeff_q_fr = -vars.nu_q_bal[fb] - 4 * vars.lam_thermal_fr[l] * prim.q_fr -
+                 vars.sig_q_fr_lb[l] - vars.sig_q_fr_ub[l]
+    coeff_p_to = -vars.nu_p_bal[tb] - 4 * vars.lam_thermal_to[l] * prim.p_to -
+                 vars.sig_p_to_lb[l] - vars.sig_p_to_ub[l]
+    coeff_q_to = -vars.nu_q_bal[tb] - 4 * vars.lam_thermal_to[l] * prim.q_to -
+                 vars.sig_q_to_lb[l] - vars.sig_q_to_ub[l]
+    angle_dual = vars.lam_angle_lb[l] + vars.lam_angle_ub[l]
 
-        Jp[idx.vm[fb], l] += coeff_p_fr * prim.dp_fr_hat[3] +
-                             coeff_q_fr * prim.dq_fr_hat[3] +
-                             coeff_p_to * prim.dp_to_hat[3] +
-                             coeff_q_to * prim.dq_to_hat[3]
-        Jp[idx.vm[tb], l] += coeff_p_fr * prim.dp_fr_hat[4] +
-                             coeff_q_fr * prim.dq_fr_hat[4] +
-                             coeff_p_to * prim.dp_to_hat[4] +
-                             coeff_q_to * prim.dq_to_hat[4]
+    d_va_f = coeff_p_fr * prim.dp_fr_hat[1] + coeff_q_fr * prim.dq_fr_hat[1] +
+             coeff_p_to * prim.dp_to_hat[1] + coeff_q_to * prim.dq_to_hat[1] -
+             angle_dual
+    d_va_t = coeff_p_fr * prim.dp_fr_hat[2] + coeff_q_fr * prim.dq_fr_hat[2] +
+             coeff_p_to * prim.dp_to_hat[2] + coeff_q_to * prim.dq_to_hat[2] +
+             angle_dual
+    d_vm_f = coeff_p_fr * prim.dp_fr_hat[3] + coeff_q_fr * prim.dq_fr_hat[3] +
+             coeff_p_to * prim.dp_to_hat[3] + coeff_q_to * prim.dq_to_hat[3]
+    d_vm_t = coeff_p_fr * prim.dp_fr_hat[4] + coeff_q_fr * prim.dq_fr_hat[4] +
+             coeff_p_to * prim.dp_to_hat[4] + coeff_q_to * prim.dq_to_hat[4]
+
+    return (
+        rows = (
+            idx.va[fb], idx.va[tb], idx.vm[fb], idx.vm[tb],
+            idx.nu_p_bal[fb], idx.nu_p_bal[tb], idx.nu_q_bal[fb], idx.nu_q_bal[tb],
+            idx.lam_thermal_fr[l], idx.lam_thermal_to[l],
+            idx.sig_p_fr_lb[l], idx.sig_p_fr_ub[l],
+            idx.sig_q_fr_lb[l], idx.sig_q_fr_ub[l],
+            idx.sig_p_to_lb[l], idx.sig_p_to_ub[l],
+            idx.sig_q_to_lb[l], idx.sig_q_to_ub[l],
+            idx.lam_angle_lb[l], idx.lam_angle_ub[l],
+        ),
+        vals = (
+            d_va_f, d_va_t, d_vm_f, d_vm_t,
+            prim.p_fr_hat, prim.p_to_hat, prim.q_fr_hat, prim.q_to_hat,
+            vars.lam_thermal_fr[l] * 2 * (prim.p_fr * prim.p_fr_hat +
+                                           prim.q_fr * prim.q_fr_hat),
+            vars.lam_thermal_to[l] * 2 * (prim.p_to * prim.p_to_hat +
+                                           prim.q_to * prim.q_to_hat),
+            vars.sig_p_fr_lb[l] * prim.p_fr_hat,
+            -vars.sig_p_fr_ub[l] * prim.p_fr_hat,
+            vars.sig_q_fr_lb[l] * prim.q_fr_hat,
+            -vars.sig_q_fr_ub[l] * prim.q_fr_hat,
+            vars.sig_p_to_lb[l] * prim.p_to_hat,
+            -vars.sig_p_to_ub[l] * prim.p_to_hat,
+            vars.sig_q_to_lb[l] * prim.q_to_hat,
+            -vars.sig_q_to_ub[l] * prim.q_to_hat,
+            vars.lam_angle_lb[l] * (vars.va[fb] - vars.va[tb] - constants.angmin[l]),
+            vars.lam_angle_ub[l] * (constants.angmax[l] - vars.va[fb] + vars.va[tb]),
+        ),
+    )
+end
+
+@inline function _add_ac_sw_param_column!(out::AbstractVector, idx::NamedTuple, vars,
+                                          constants, prim, l::Int, scale=1.0)
+    terms = _ac_sw_param_column_terms(idx, vars, constants, prim, l)
+    @inbounds for q in eachindex(terms.rows)
+        out[terms.rows[q]] += scale * terms.vals[q]
     end
-    return nothing
+    return out
+end
+
+@inline function _dot_ac_sw_param_column(u::AbstractVector, idx::NamedTuple, vars,
+                                         constants, prim, l::Int)
+    terms = _ac_sw_param_column_terms(idx, vars, constants, prim, l)
+    acc = zero(eltype(u))
+    @inbounds for q in eachindex(terms.rows)
+        acc += u[terms.rows[q]] * terms.vals[q]
+    end
+    return acc
 end
 
 function _fill_ac_param_jacobian_sw!(Jp::AbstractMatrix, prob::ACOPFProblem,
                                      sol::ACOPFSolution, idx::NamedTuple, constants)
-    vars = unflatten_variables(flatten_variables(sol, prob), idx)
-    va = vars.va
-    vm = vars.vm
+    vars = sol
+    va = sol.va
+    vm = sol.vm
     sw = prob.network.sw
 
     @inbounds for l in 1:prob.network.m
-        prim = _branch_flow_primitives(va, vm, sw, constants, l)
-        fb = prim.fb
-        tb = prim.tb
-
-        coeff_p_fr = -vars.nu_p_bal[fb] - 4 * vars.lam_thermal_fr[l] * prim.p_fr -
-                     vars.sig_p_fr_lb[l] - vars.sig_p_fr_ub[l]
-        coeff_q_fr = -vars.nu_q_bal[fb] - 4 * vars.lam_thermal_fr[l] * prim.q_fr -
-                     vars.sig_q_fr_lb[l] - vars.sig_q_fr_ub[l]
-        coeff_p_to = -vars.nu_p_bal[tb] - 4 * vars.lam_thermal_to[l] * prim.p_to -
-                     vars.sig_p_to_lb[l] - vars.sig_p_to_ub[l]
-        coeff_q_to = -vars.nu_q_bal[tb] - 4 * vars.lam_thermal_to[l] * prim.q_to -
-                     vars.sig_q_to_lb[l] - vars.sig_q_to_ub[l]
-
-        _add_stationarity_sw_flow_terms!(
-            Jp, idx, vars, prim, l, coeff_p_fr, coeff_q_fr, coeff_p_to, coeff_q_to)
-
-        Jp[idx.nu_p_bal[fb], l] += prim.p_fr_hat
-        Jp[idx.nu_p_bal[tb], l] += prim.p_to_hat
-        Jp[idx.nu_q_bal[fb], l] += prim.q_fr_hat
-        Jp[idx.nu_q_bal[tb], l] += prim.q_to_hat
-
-        Jp[idx.lam_thermal_fr[l], l] = vars.lam_thermal_fr[l] *
-                                       2 * (prim.p_fr * prim.p_fr_hat + prim.q_fr * prim.q_fr_hat)
-        Jp[idx.lam_thermal_to[l], l] = vars.lam_thermal_to[l] *
-                                       2 * (prim.p_to * prim.p_to_hat + prim.q_to * prim.q_to_hat)
-
-        Jp[idx.sig_p_fr_lb[l], l] = vars.sig_p_fr_lb[l] * prim.p_fr_hat
-        Jp[idx.sig_p_fr_ub[l], l] = -vars.sig_p_fr_ub[l] * prim.p_fr_hat
-        Jp[idx.sig_q_fr_lb[l], l] = vars.sig_q_fr_lb[l] * prim.q_fr_hat
-        Jp[idx.sig_q_fr_ub[l], l] = -vars.sig_q_fr_ub[l] * prim.q_fr_hat
-        Jp[idx.sig_p_to_lb[l], l] = vars.sig_p_to_lb[l] * prim.p_to_hat
-        Jp[idx.sig_p_to_ub[l], l] = -vars.sig_p_to_ub[l] * prim.p_to_hat
-        Jp[idx.sig_q_to_lb[l], l] = vars.sig_q_to_lb[l] * prim.q_to_hat
-        Jp[idx.sig_q_to_ub[l], l] = -vars.sig_q_to_ub[l] * prim.q_to_hat
-
-        # Angle difference constraint terms (∂K/∂sw)
-        Jp[idx.va[fb], l] += -(vars.lam_angle_lb[l] + vars.lam_angle_ub[l])
-        Jp[idx.va[tb], l] += (vars.lam_angle_lb[l] + vars.lam_angle_ub[l])
-        Jp[idx.lam_angle_lb[l], l] = vars.lam_angle_lb[l] * (va[fb] - va[tb] - constants.angmin[l])
-        Jp[idx.lam_angle_ub[l], l] = vars.lam_angle_ub[l] * (constants.angmax[l] - va[fb] + va[tb])
+        prim = _branch_flow_gradients(va, vm, sw, constants, l)
+        _add_ac_sw_param_column!(@view(Jp[:, l]), idx, vars, constants, prim, l)
     end
     return Jp
 end
@@ -1106,8 +1294,6 @@ function calc_kkt_jacobian_param(prob::ACOPFProblem, sol::ACOPFSolution, param::
         "Unknown AC OPF parameter: $param. Valid: $(keys(_AC_PARAM_EXTRACT))"))
 
     idx = kkt_indices(prob)
-    z0 = flatten_variables(sol, prob)
-    vars = unflatten_variables(z0, idx)
     p0 = _AC_PARAM_EXTRACT[param](prob)
     Jp = zeros(Float64, kkt_dims(prob), length(p0))
 
@@ -1126,9 +1312,9 @@ function calc_kkt_jacobian_param(prob::ACOPFProblem, sol::ACOPFSolution, param::
     elseif param === :cl
         return _fill_ac_param_jacobian_cost_linear!(Jp, idx, prob.n_gen)
     elseif param === :cq
-        return _fill_ac_param_jacobian_cost_quadratic!(Jp, idx, vars.pg, prob.n_gen)
+        return _fill_ac_param_jacobian_cost_quadratic!(Jp, idx, sol.pg, prob.n_gen)
     elseif param === :fmax
-        return _fill_ac_param_jacobian_fmax!(Jp, idx, vars, p0, prob.network.m)
+        return _fill_ac_param_jacobian_fmax!(Jp, idx, sol, p0, prob.network.m)
     end
 
     error("Unhandled AC OPF parameter: $param")
@@ -1268,8 +1454,7 @@ parameter Jacobian.
 """
 function _calc_ac_kkt_param_column(prob::ACOPFProblem, sol::ACOPFSolution, param::Symbol, col_idx::Int)
     idx = kkt_indices(prob)
-    z0 = flatten_variables(sol, prob)
-    vars = unflatten_variables(z0, idx)
+    vars = sol
     p0 = _AC_PARAM_EXTRACT[param](prob)
     Kcol = zeros(Float64, kkt_dims(prob))
 
@@ -1280,46 +1465,8 @@ function _calc_ac_kkt_param_column(prob::ACOPFProblem, sol::ACOPFSolution, param
     end
 
     if param === :sw
-        prim = _branch_flow_primitives(vars.va, vars.vm, prob.network.sw, constants, col_idx)
-        fb = prim.fb
-        tb = prim.tb
-
-        coeff_p_fr = -vars.nu_p_bal[fb] - 4 * vars.lam_thermal_fr[col_idx] * prim.p_fr -
-                     vars.sig_p_fr_lb[col_idx] - vars.sig_p_fr_ub[col_idx]
-        coeff_q_fr = -vars.nu_q_bal[fb] - 4 * vars.lam_thermal_fr[col_idx] * prim.q_fr -
-                     vars.sig_q_fr_lb[col_idx] - vars.sig_q_fr_ub[col_idx]
-        coeff_p_to = -vars.nu_p_bal[tb] - 4 * vars.lam_thermal_to[col_idx] * prim.p_to -
-                     vars.sig_p_to_lb[col_idx] - vars.sig_p_to_ub[col_idx]
-        coeff_q_to = -vars.nu_q_bal[tb] - 4 * vars.lam_thermal_to[col_idx] * prim.q_to -
-                     vars.sig_q_to_lb[col_idx] - vars.sig_q_to_ub[col_idx]
-
-        _add_stationarity_sw_flow_terms!(
-            reshape(Kcol, :, 1), idx, vars, prim, 1, coeff_p_fr, coeff_q_fr, coeff_p_to, coeff_q_to)
-
-        Kcol[idx.nu_p_bal[fb]] += prim.p_fr_hat
-        Kcol[idx.nu_p_bal[tb]] += prim.p_to_hat
-        Kcol[idx.nu_q_bal[fb]] += prim.q_fr_hat
-        Kcol[idx.nu_q_bal[tb]] += prim.q_to_hat
-
-        Kcol[idx.lam_thermal_fr[col_idx]] = vars.lam_thermal_fr[col_idx] *
-                                            2 * (prim.p_fr * prim.p_fr_hat + prim.q_fr * prim.q_fr_hat)
-        Kcol[idx.lam_thermal_to[col_idx]] = vars.lam_thermal_to[col_idx] *
-                                            2 * (prim.p_to * prim.p_to_hat + prim.q_to * prim.q_to_hat)
-
-        Kcol[idx.sig_p_fr_lb[col_idx]] = vars.sig_p_fr_lb[col_idx] * prim.p_fr_hat
-        Kcol[idx.sig_p_fr_ub[col_idx]] = -vars.sig_p_fr_ub[col_idx] * prim.p_fr_hat
-        Kcol[idx.sig_q_fr_lb[col_idx]] = vars.sig_q_fr_lb[col_idx] * prim.q_fr_hat
-        Kcol[idx.sig_q_fr_ub[col_idx]] = -vars.sig_q_fr_ub[col_idx] * prim.q_fr_hat
-        Kcol[idx.sig_p_to_lb[col_idx]] = vars.sig_p_to_lb[col_idx] * prim.p_to_hat
-        Kcol[idx.sig_p_to_ub[col_idx]] = -vars.sig_p_to_ub[col_idx] * prim.p_to_hat
-        Kcol[idx.sig_q_to_lb[col_idx]] = vars.sig_q_to_lb[col_idx] * prim.q_to_hat
-        Kcol[idx.sig_q_to_ub[col_idx]] = -vars.sig_q_to_ub[col_idx] * prim.q_to_hat
-        Kcol[idx.va[fb]] += -(vars.lam_angle_lb[col_idx] + vars.lam_angle_ub[col_idx])
-        Kcol[idx.va[tb]] += vars.lam_angle_lb[col_idx] + vars.lam_angle_ub[col_idx]
-        Kcol[idx.lam_angle_lb[col_idx]] = vars.lam_angle_lb[col_idx] *
-                                          (vars.va[fb] - vars.va[tb] - constants.angmin[col_idx])
-        Kcol[idx.lam_angle_ub[col_idx]] = vars.lam_angle_ub[col_idx] *
-                                          (constants.angmax[col_idx] - vars.va[fb] + vars.va[tb])
+        prim = _branch_flow_gradients(vars.va, vars.vm, prob.network.sw, constants, col_idx)
+        _add_ac_sw_param_column!(Kcol, idx, vars, constants, prim, col_idx)
         return Kcol
     end
 

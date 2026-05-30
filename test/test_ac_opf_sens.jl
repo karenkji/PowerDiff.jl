@@ -19,6 +19,7 @@
 
 using PowerDiff
 using PowerModels
+using ForwardDiff
 using LinearAlgebra
 using Test
 
@@ -249,6 +250,38 @@ using Test
         Jsw = Matrix(PowerDiff.calc_kkt_jacobian_param(prob, sol, :sw))
         Jsw_fd = ForwardDiff.jacobian(ss -> kkt(z, prob, ss), sw)
         @test maximum(abs.(Jsw .- Jsw_fd)) < 1e-7
+
+        for l in axes(Jsw, 2)
+            col = PowerDiff._calc_ac_kkt_param_column(prob, sol, :sw, l)
+            @test maximum(abs.(Jsw[:, l] .- col)) < 1e-7
+        end
+    end
+
+    @testset "Switching JVP/VJP slow paths respect partial switching" begin
+        prob = ACOPFProblem(pm_data; silent=true)
+        sw = copy(prob.network.sw)
+        sw[3] = 0.5
+        sw[5] = 0.8
+        update_switching!(prob, sw)
+        sol = solve!(prob)
+
+        S = calc_sensitivity(prob, :vm, :sw)
+        tang = collect(range(-0.3, 0.4; length=size(S, 2)))
+        adj = collect(range(0.2, -0.25; length=size(S, 1)))
+        expected_jvp = S.matrix * tang
+        expected_vjp = S.matrix' * adj
+
+        invalidate!(prob.cache)
+        prob.cache.solution = sol
+        @test isnothing(prob.cache.dz_dsw)
+        @test jvp(prob, :vm, :sw, tang) ≈ expected_jvp atol=1e-6
+        @test isnothing(prob.cache.dz_dsw)
+
+        invalidate!(prob.cache)
+        prob.cache.solution = sol
+        @test isnothing(prob.cache.dz_dsw)
+        @test vjp(prob, :vm, :sw, adj) ≈ expected_vjp atol=1e-6
+        @test isnothing(prob.cache.dz_dsw)
     end
 
     @testset "Single ∂K/∂sw column includes angle-limit terms" begin

@@ -295,7 +295,7 @@ end
 # AC OPF: Analytical Parameter Actions
 # =============================================================================
 
-"""Pre-extract all AC OPF parameter/state data needed by the analytical slow path."""
+"""Pre-extract the AC OPF solution, indices, constants, and flow limits used by slow paths."""
 function _ac_kkt_context(prob::ACOPFProblem)
     sol = _ensure_ac_solved!(prob)
     idx = kkt_indices(prob)
@@ -304,18 +304,13 @@ function _ac_kkt_context(prob::ACOPFProblem)
         constants = _extract_kkt_constants(prob)
         prob.cache.kkt_constants = constants
     end
-    pd0 = _extract_bus_pd(prob)
-    qd0 = _extract_bus_qd(prob)
-    cq0 = _extract_gen_cq(prob)
-    cl0 = _extract_gen_cl(prob)
-    fmax0 = _extract_branch_fmax(prob)
-    return (; sol, idx, constants, pd0, qd0, cq0, cl0, fmax0)
+    fmax = _extract_branch_fmax(prob)
+    return (; sol, idx, constants, fmax)
 end
 
 function _ac_param_vjp!(out::AbstractVector, prob::ACOPFProblem, ctx, param::Symbol, u::AbstractVector)
     sol = ctx.sol
     idx = ctx.idx
-    vars = unflatten_variables(flatten_variables(sol, prob), idx)
 
     if param === :d
         copyto!(out, @view(u[idx.nu_p_bal]))
@@ -332,8 +327,8 @@ function _ac_param_vjp!(out::AbstractVector, prob::ACOPFProblem, ctx, param::Sym
         end
         return out
     elseif param === :fmax
-        @inbounds for l in eachindex(ctx.fmax0)
-            out[l] = -2 * ctx.fmax0[l] * (
+        @inbounds for l in eachindex(ctx.fmax)
+            out[l] = -2 * ctx.fmax[l] * (
                 sol.lam_thermal_fr[l] * u[idx.lam_thermal_fr[l]] +
                 sol.lam_thermal_to[l] * u[idx.lam_thermal_to[l]]
             ) +
@@ -350,46 +345,8 @@ function _ac_param_vjp!(out::AbstractVector, prob::ACOPFProblem, ctx, param::Sym
     end
 
     @inbounds for l in 1:prob.network.m
-        prim = _branch_flow_primitives(sol.va, sol.vm, prob.network.sw, ctx.constants, l)
-        fb = prim.fb
-        tb = prim.tb
-
-        coeff_p_fr = -sol.nu_p_bal[fb] - 4 * sol.lam_thermal_fr[l] * prim.p_fr -
-                     sol.sig_p_fr_lb[l] - sol.sig_p_fr_ub[l]
-        coeff_q_fr = -sol.nu_q_bal[fb] - 4 * sol.lam_thermal_fr[l] * prim.q_fr -
-                     sol.sig_q_fr_lb[l] - sol.sig_q_fr_ub[l]
-        coeff_p_to = -sol.nu_p_bal[tb] - 4 * sol.lam_thermal_to[l] * prim.p_to -
-                     sol.sig_p_to_lb[l] - sol.sig_p_to_ub[l]
-        coeff_q_to = -sol.nu_q_bal[tb] - 4 * sol.lam_thermal_to[l] * prim.q_to -
-                     sol.sig_q_to_lb[l] - sol.sig_q_to_ub[l]
-
-        out[l] =
-            u[idx.va[fb]] * (coeff_p_fr * prim.dp_fr_hat[1] + coeff_q_fr * prim.dq_fr_hat[1] +
-                             coeff_p_to * prim.dp_to_hat[1] + coeff_q_to * prim.dq_to_hat[1]) +
-            u[idx.va[tb]] * (coeff_p_fr * prim.dp_fr_hat[2] + coeff_q_fr * prim.dq_fr_hat[2] +
-                             coeff_p_to * prim.dp_to_hat[2] + coeff_q_to * prim.dq_to_hat[2]) +
-            u[idx.vm[fb]] * (coeff_p_fr * prim.dp_fr_hat[3] + coeff_q_fr * prim.dq_fr_hat[3] +
-                             coeff_p_to * prim.dp_to_hat[3] + coeff_q_to * prim.dq_to_hat[3]) +
-            u[idx.vm[tb]] * (coeff_p_fr * prim.dp_fr_hat[4] + coeff_q_fr * prim.dq_fr_hat[4] +
-                             coeff_p_to * prim.dp_to_hat[4] + coeff_q_to * prim.dq_to_hat[4]) +
-            u[idx.nu_p_bal[fb]] * prim.p_fr_hat +
-            u[idx.nu_p_bal[tb]] * prim.p_to_hat +
-            u[idx.nu_q_bal[fb]] * prim.q_fr_hat +
-            u[idx.nu_q_bal[tb]] * prim.q_to_hat +
-            u[idx.lam_thermal_fr[l]] * (2 * sol.lam_thermal_fr[l] * (prim.p_fr * prim.p_fr_hat + prim.q_fr * prim.q_fr_hat)) +
-            u[idx.lam_thermal_to[l]] * (2 * sol.lam_thermal_to[l] * (prim.p_to * prim.p_to_hat + prim.q_to * prim.q_to_hat)) +
-            u[idx.sig_p_fr_lb[l]] * (sol.sig_p_fr_lb[l] * prim.p_fr_hat) +
-            u[idx.sig_p_fr_ub[l]] * (-sol.sig_p_fr_ub[l] * prim.p_fr_hat) +
-            u[idx.sig_q_fr_lb[l]] * (sol.sig_q_fr_lb[l] * prim.q_fr_hat) +
-            u[idx.sig_q_fr_ub[l]] * (-sol.sig_q_fr_ub[l] * prim.q_fr_hat) +
-            u[idx.sig_p_to_lb[l]] * (sol.sig_p_to_lb[l] * prim.p_to_hat) +
-            u[idx.sig_p_to_ub[l]] * (-sol.sig_p_to_ub[l] * prim.p_to_hat) +
-            u[idx.sig_q_to_lb[l]] * (sol.sig_q_to_lb[l] * prim.q_to_hat) +
-            u[idx.sig_q_to_ub[l]] * (-sol.sig_q_to_ub[l] * prim.q_to_hat) +
-            u[idx.va[fb]] * (-(sol.lam_angle_lb[l] + sol.lam_angle_ub[l])) +
-            u[idx.va[tb]] * (sol.lam_angle_lb[l] + sol.lam_angle_ub[l]) +
-            u[idx.lam_angle_lb[l]] * (sol.lam_angle_lb[l] * (sol.va[fb] - sol.va[tb] - ctx.constants.angmin[l])) +
-            u[idx.lam_angle_ub[l]] * (sol.lam_angle_ub[l] * (ctx.constants.angmax[l] - sol.va[fb] + sol.va[tb]))
+        prim = _branch_flow_gradients(sol.va, sol.vm, prob.network.sw, ctx.constants, l)
+        out[l] = _dot_ac_sw_param_column(u, idx, sol, ctx.constants, prim, l)
     end
     return out
 end
@@ -414,10 +371,10 @@ function _ac_param_jvp!(v::AbstractVector, prob::ACOPFProblem, ctx, param::Symbo
         end
         return v
     elseif param === :fmax
-        @inbounds for l in eachindex(ctx.fmax0)
+        @inbounds for l in eachindex(ctx.fmax)
             t = tang[l]
-            v[idx.lam_thermal_fr[l]] += -2 * sol.lam_thermal_fr[l] * ctx.fmax0[l] * t
-            v[idx.lam_thermal_to[l]] += -2 * sol.lam_thermal_to[l] * ctx.fmax0[l] * t
+            v[idx.lam_thermal_fr[l]] += -2 * sol.lam_thermal_fr[l] * ctx.fmax[l] * t
+            v[idx.lam_thermal_to[l]] += -2 * sol.lam_thermal_to[l] * ctx.fmax[l] * t
             v[idx.sig_p_fr_lb[l]] += sol.sig_p_fr_lb[l] * t
             v[idx.sig_p_fr_ub[l]] += sol.sig_p_fr_ub[l] * t
             v[idx.sig_q_fr_lb[l]] += sol.sig_q_fr_lb[l] * t
@@ -433,48 +390,8 @@ function _ac_param_jvp!(v::AbstractVector, prob::ACOPFProblem, ctx, param::Symbo
     @inbounds for l in 1:prob.network.m
         t = tang[l]
         t == 0.0 && continue
-        prim = _branch_flow_primitives(sol.va, sol.vm, prob.network.sw, ctx.constants, l)
-        fb = prim.fb
-        tb = prim.tb
-
-        coeff_p_fr = -sol.nu_p_bal[fb] - 4 * sol.lam_thermal_fr[l] * prim.p_fr -
-                     sol.sig_p_fr_lb[l] - sol.sig_p_fr_ub[l]
-        coeff_q_fr = -sol.nu_q_bal[fb] - 4 * sol.lam_thermal_fr[l] * prim.q_fr -
-                     sol.sig_q_fr_lb[l] - sol.sig_q_fr_ub[l]
-        coeff_p_to = -sol.nu_p_bal[tb] - 4 * sol.lam_thermal_to[l] * prim.p_to -
-                     sol.sig_p_to_lb[l] - sol.sig_p_to_ub[l]
-        coeff_q_to = -sol.nu_q_bal[tb] - 4 * sol.lam_thermal_to[l] * prim.q_to -
-                     sol.sig_q_to_lb[l] - sol.sig_q_to_ub[l]
-
-        v[idx.va[fb]] += t * (coeff_p_fr * prim.dp_fr_hat[1] + coeff_q_fr * prim.dq_fr_hat[1] +
-                              coeff_p_to * prim.dp_to_hat[1] + coeff_q_to * prim.dq_to_hat[1])
-        v[idx.va[tb]] += t * (coeff_p_fr * prim.dp_fr_hat[2] + coeff_q_fr * prim.dq_fr_hat[2] +
-                              coeff_p_to * prim.dp_to_hat[2] + coeff_q_to * prim.dq_to_hat[2])
-        v[idx.vm[fb]] += t * (coeff_p_fr * prim.dp_fr_hat[3] + coeff_q_fr * prim.dq_fr_hat[3] +
-                              coeff_p_to * prim.dp_to_hat[3] + coeff_q_to * prim.dq_to_hat[3])
-        v[idx.vm[tb]] += t * (coeff_p_fr * prim.dp_fr_hat[4] + coeff_q_fr * prim.dq_fr_hat[4] +
-                              coeff_p_to * prim.dp_to_hat[4] + coeff_q_to * prim.dq_to_hat[4])
-
-        v[idx.nu_p_bal[fb]] += t * prim.p_fr_hat
-        v[idx.nu_p_bal[tb]] += t * prim.p_to_hat
-        v[idx.nu_q_bal[fb]] += t * prim.q_fr_hat
-        v[idx.nu_q_bal[tb]] += t * prim.q_to_hat
-
-        v[idx.lam_thermal_fr[l]] += t * 2 * sol.lam_thermal_fr[l] * (prim.p_fr * prim.p_fr_hat + prim.q_fr * prim.q_fr_hat)
-        v[idx.lam_thermal_to[l]] += t * 2 * sol.lam_thermal_to[l] * (prim.p_to * prim.p_to_hat + prim.q_to * prim.q_to_hat)
-
-        v[idx.sig_p_fr_lb[l]] += t * sol.sig_p_fr_lb[l] * prim.p_fr_hat
-        v[idx.sig_p_fr_ub[l]] += -t * sol.sig_p_fr_ub[l] * prim.p_fr_hat
-        v[idx.sig_q_fr_lb[l]] += t * sol.sig_q_fr_lb[l] * prim.q_fr_hat
-        v[idx.sig_q_fr_ub[l]] += -t * sol.sig_q_fr_ub[l] * prim.q_fr_hat
-        v[idx.sig_p_to_lb[l]] += t * sol.sig_p_to_lb[l] * prim.p_to_hat
-        v[idx.sig_p_to_ub[l]] += -t * sol.sig_p_to_ub[l] * prim.p_to_hat
-        v[idx.sig_q_to_lb[l]] += t * sol.sig_q_to_lb[l] * prim.q_to_hat
-        v[idx.sig_q_to_ub[l]] += -t * sol.sig_q_to_ub[l] * prim.q_to_hat
-        v[idx.va[fb]] += -t * (sol.lam_angle_lb[l] + sol.lam_angle_ub[l])
-        v[idx.va[tb]] += t * (sol.lam_angle_lb[l] + sol.lam_angle_ub[l])
-        v[idx.lam_angle_lb[l]] += t * sol.lam_angle_lb[l] * (sol.va[fb] - sol.va[tb] - ctx.constants.angmin[l])
-        v[idx.lam_angle_ub[l]] += t * sol.lam_angle_ub[l] * (ctx.constants.angmax[l] - sol.va[fb] + sol.va[tb])
+        prim = _branch_flow_gradients(sol.va, sol.vm, prob.network.sw, ctx.constants, l)
+        _add_ac_sw_param_column!(v, idx, sol, ctx.constants, prim, l, t)
     end
     return v
 end
@@ -495,7 +412,8 @@ function _acopf_vjp(prob::ACOPFProblem, op::Symbol, param::Symbol, adj::Abstract
         return Vector((sign .* cached[op_rows, :])' * adj)
     end
 
-    # Slow path: one transpose solve + one analytical parameter VJP
+    # Slow path: avoid materializing dz/dp. Solve K' * u = selected adjoint,
+    # then apply the analytical parameter action (dK/dp)' * u.
     kkt_lu = _ensure_ac_kkt_factor!(prob)
     ctx = _ac_kkt_context(prob)
 
@@ -521,7 +439,7 @@ function _acopf_jvp(prob::ACOPFProblem, op::Symbol, param::Symbol, tang::Abstrac
         return Vector(sign .* (cached[op_rows, :] * tang))
     end
 
-    # Slow path: one analytical parameter JVP + one forward solve
+    # Slow path: form only the directional KKT RHS (dK/dp) * tang, then solve.
     kkt_lu = _ensure_ac_kkt_factor!(prob)
     ctx = _ac_kkt_context(prob)
 
