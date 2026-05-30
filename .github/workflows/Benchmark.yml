@@ -1,0 +1,23 @@
+name: Benchmark this PR
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: benchmark-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: MilesCranmer/AirspeedVelocity.jl@315c11b51ceee8ebd6063d70cff6ae499a040d28
+        with:
+          julia-version: '1'
+          mode: 'time,memory'
+          script: benchmark/benchmarks.jl

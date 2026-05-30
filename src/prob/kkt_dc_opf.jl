@@ -71,6 +71,9 @@ function _ensure_kkt_factor!(prob::DCOPFProblem)
     return prob.cache.kkt_factor
 end
 
+# Must match solve!'s snap tolerance so the canonicalized duals agree with the KKT system.
+@inline _is_fixed_zero_shed(d::Real) = abs(d) < COMPLEMENTARITY_SNAP_TOL
+
 # =============================================================================
 # Cached Derivative Computation Functions
 # =============================================================================
@@ -230,7 +233,7 @@ const _DC_CACHE_FIELD = Dict{Symbol, Symbol}(
 # Map parameter symbols to single-column Jacobian builder functions.
 # Each returns Vector{Float64} of size kkt_dims — O(1) nonzeros per column.
 const _DC_PARAM_COL_FN = Dict{Symbol, Function}(
-    :d    => (prob, sol, j) -> calc_kkt_jacobian_demand_column(prob.network, sol, j),
+    :d    => (prob, sol, j) -> calc_kkt_jacobian_demand_column(prob.network, prob.d, sol, j),
     :sw   => (prob, sol, e) -> calc_kkt_jacobian_switching_column(prob, sol, e),
     :cq   => (prob, sol, j) -> calc_kkt_jacobian_cost_quadratic_column(prob.network, sol, j),
     :cl   => (prob, _, j)   -> calc_kkt_jacobian_cost_linear_column(prob.network, j),
@@ -282,11 +285,14 @@ The KKT system includes:
 Total: 5n + 6m + 3k + 1
 """
 kkt_dims(prob::DCOPFProblem) = kkt_dims(prob.network)
+kkt_dims(n::Int, m::Int, k::Int) = 5n + 6m + 3k + 1
 
 function kkt_dims(net::DCNetwork)
-    n, m, k = net.n, net.m, net.k
+    n = getfield(net, :n)
+    m = getfield(net, :m)
+    k = getfield(net, :k)
     # va(n) + pg(k) + f(m) + psh(n) + lam_lb(m) + lam_ub(m) + gamma_lb(m) + gamma_ub(m) + rho_lb(k) + rho_ub(k) + mu_lb(n) + mu_ub(n) + nu_bal(n) + nu_flow(m) + ref(1)
-    return 5n + 6m + 3k + 1
+    return kkt_dims(n, m, k)
 end
 
 """
@@ -485,9 +491,21 @@ function kkt(z::AbstractVector, net::DCNetwork, d::AbstractVector)
     K_ρ_lb = ρ_lb .* (g - net.gmin)
     K_ρ_ub = ρ_ub .* (net.gmax - g)
 
-    # 8. Complementary slackness: load shedding bounds
-    K_μ_lb = μ_lb .* psh
-    K_μ_ub = μ_ub .* (d - psh)
+    # 8. Load shedding bounds
+    # If d[i] == 0, psh[i] is structurally fixed to zero and the upper-bound
+    # dual is redundant. Replace the degenerate complementarity pair by
+    # psh[i] = 0 and μ_ub[i] = 0 to avoid an exactly singular KKT block.
+    K_μ_lb = similar(psh)
+    K_μ_ub = similar(psh)
+    @inbounds for i in 1:n
+        if _is_fixed_zero_shed(d[i])
+            K_μ_lb[i] = psh[i]
+            K_μ_ub[i] = μ_ub[i]
+        else
+            K_μ_lb[i] = μ_lb[i] * psh[i]
+            K_μ_ub[i] = μ_ub[i] * (d[i] - psh[i])
+        end
+    end
 
     # 9. Primal feasibility: power balance (G_inc * g + psh - d = B * θ)
     K_power_bal = net.G_inc * g + psh - d - B_mat * θ
@@ -526,122 +544,273 @@ function calc_kkt_jacobian(prob::DCOPFProblem; sol::Union{DCOPFSolution,Nothing}
     return calc_kkt_jacobian(prob.network, prob.d, prob, sol)
 end
 
-function calc_kkt_jacobian(net::DCNetwork, d::AbstractVector, prob::DCOPFProblem, sol::DCOPFSolution)
-    n, m, k = net.n, net.m, net.k
-    dim = kkt_dims(net)
+@inline function _push_csc_entry!(rowval::Vector{Int}, nzval::Vector{Float64}, row::Int, val::Real)
+    iszero(val) && return nothing
+    push!(rowval, row)
+    push!(nzval, Float64(val))
+    return nothing
+end
 
-    vars = (
-        va = sol.va, pg = sol.pg, f = sol.f, psh = sol.psh,
-        lam_lb = sol.lam_lb, lam_ub = sol.lam_ub,
-        gamma_lb = sol.gamma_lb, gamma_ub = sol.gamma_ub,
-        rho_lb = sol.rho_lb, rho_ub = sol.rho_ub,
-        mu_lb = sol.mu_lb, mu_ub = sol.mu_ub,
-        nu_bal = sol.nu_bal
-    )
+# SparseArrays provides fast column iteration for SparseMatrixCSC, but not row
+# iteration on the lazy transpose. This cache gives row-wise access without
+# materializing sparse(transpose(M)) in the KKT hot path.
+function _sparse_row_storage(M::SparseMatrixCSC)
+    nrow = size(M, 1)
+    rows, cols, vals = findnz(M)
+    counts = zeros(Int, nrow)
+    @inbounds for row in rows
+        counts[row] += 1
+    end
+    rowptr = Vector{Int}(undef, nrow + 1)
+    rowptr[1] = 1
+    @inbounds for i in 1:nrow
+        rowptr[i + 1] = rowptr[i] + counts[i]
+    end
+    colind = Vector{Int}(undef, length(rows))
+    rownzval = Vector{Float64}(undef, length(rows))
+    next = copy(rowptr)
+    @inbounds for p in eachindex(rows)
+        dest = next[rows[p]]
+        colind[dest] = cols[p]
+        rownzval[dest] = vals[p]
+        next[rows[p]] += 1
+    end
+    return rowptr, colind, rownzval
+end
+
+function calc_kkt_jacobian(net::DCNetwork, d::AbstractVector, prob::DCOPFProblem, sol::DCOPFSolution)
+    # Use getfield in this hot path because these types overload getproperty
+    # for Unicode aliases, which obscures concrete field types from inference.
+    n = getfield(net, :n)
+    m = getfield(net, :m)
+    k = getfield(net, :k)
+    dim = kkt_dims(n, m, k)
+    A = getfield(net, :A)
+    G_inc = getfield(net, :G_inc)
+    b = getfield(net, :b)
+    sw = getfield(net, :sw)
+    fmax = getfield(net, :fmax)
+    gmin = getfield(net, :gmin)
+    gmax = getfield(net, :gmax)
+    cq = getfield(net, :cq)
+    angmin = getfield(net, :angmin)
+    angmax = getfield(net, :angmax)
+    ref_bus = getfield(net, :ref_bus)
+    tau = getfield(net, :tau)
+    va = getfield(sol, :va)
+    pg = getfield(sol, :pg)
+    f = getfield(sol, :f)
+    psh = getfield(sol, :psh)
+    lam_lb = getfield(sol, :lam_lb)
+    lam_ub = getfield(sol, :lam_ub)
+    gamma_lb = getfield(sol, :gamma_lb)
+    gamma_ub = getfield(sol, :gamma_ub)
+    rho_lb = getfield(sol, :rho_lb)
+    rho_ub = getfield(sol, :rho_ub)
+    mu_lb = getfield(sol, :mu_lb)
+    mu_ub = getfield(sol, :mu_ub)
 
     # Construct matrices
-    W = Diagonal(-net.b .* net.sw)
-    B_mat = sparse(net.A' * W * net.A)
-    WA = sparse(W * net.A)
-
-    # Reference bus indicator
-    e_ref = spzeros(n, 1)
-    e_ref[net.ref_bus, 1] = 1.0
+    W = Diagonal(-b .* sw)
+    B_mat = sparse(A' * W * A)
 
     # Build Jacobian blocks using centralized index calculation
     idx = kkt_indices(n, m, k)
+    A_rowptr, A_rowcols, A_rowvals = _sparse_row_storage(A)
+    G_rowptr, G_rowcols, G_rowvals = _sparse_row_storage(G_inc)
+    rowval = Int[]
+    nzval = Float64[]
+    entry_hint = 4 * nnz(A) + 2 * nnz(B_mat) + 2 * nnz(G_inc) + 5n + 10m + 7k + 1
+    sizehint!(rowval, entry_hint)
+    sizehint!(nzval, entry_hint)
+    colptr = Vector{Int}(undef, dim + 1)
+    Aθ = A * va
 
-    # Cache sparse identity matrices (reused across blocks)
-    I_n = sparse(I, n, n)
-    I_m = sparse(I, m, m)
-    I_k = sparse(I, k, k)
+    @inline function start_col!(col::Int)
+        colptr[col] = length(rowval) + 1
+        return nothing
+    end
 
-    J = spzeros(dim, dim)
+    # Column-wise CSC assembly of ∂K/∂z. The groups below mirror the block
+    # formulas from the original assignment form while avoiding temporary
+    # SparseMatrixCSC diagonals and structural setindex! insertions.
 
-    # ∂K_θ/∂...
-    # K_θ = B' * ν_bal + WA' * ν_flow + e_ref * η_ref + A'*(γ_ub - γ_lb)
-    J[idx.va, idx.nu_bal] = B_mat'
-    J[idx.va, idx.nu_flow] = WA'
-    J[idx.va, idx.η] = e_ref
-    J[idx.va, idx.gamma_lb] = -net.A' * Diagonal(net.sw)
-    J[idx.va, idx.gamma_ub] = net.A' * Diagonal(net.sw)
+    # va columns:
+    # ∂K_γ_lb/∂θ = Diag(γ_lb .* sw) * A
+    # ∂K_γ_ub/∂θ = -Diag(γ_ub .* sw) * A
+    # ∂K_power_bal/∂θ = -B
+    # ∂K_flow_def/∂θ = -W*A, where W = Diag(-b .* sw)
+    # ∂K_ref/∂θ_ref = 1
+    @inbounds for j in 1:n
+        start_col!(idx.va[j])
+        for p in nzrange(A, j)
+            e = rowvals(A)[p]
+            aej = nonzeros(A)[p]
+            _push_csc_entry!(rowval, nzval, idx.gamma_lb[e], gamma_lb[e] * sw[e] * aej)
+        end
+        for p in nzrange(A, j)
+            e = rowvals(A)[p]
+            aej = nonzeros(A)[p]
+            _push_csc_entry!(rowval, nzval, idx.gamma_ub[e], -gamma_ub[e] * sw[e] * aej)
+        end
+        for p in nzrange(B_mat, j)
+            _push_csc_entry!(rowval, nzval, idx.nu_bal[rowvals(B_mat)[p]], -nonzeros(B_mat)[p])
+        end
+        for p in nzrange(A, j)
+            e = rowvals(A)[p]
+            _push_csc_entry!(rowval, nzval, idx.nu_flow[e], b[e] * sw[e] * nonzeros(A)[p])
+        end
+        j == ref_bus && _push_csc_entry!(rowval, nzval, idx.η, 1.0)
+    end
 
-    # ∂K_g/∂...
-    # K_g = 2*Cq * g + cl - G_inc' * ν_bal - ρ_lb + ρ_ub
-    J[idx.pg, idx.pg] = 2 * sparse(Diagonal(net.cq))
-    J[idx.pg, idx.rho_lb] = -I_k
-    J[idx.pg, idx.rho_ub] = I_k
-    J[idx.pg, idx.nu_bal] = -net.G_inc'
+    # pg columns:
+    # ∂K_g/∂g = 2*Diag(cq)
+    # ∂K_ρ_lb/∂g = Diag(ρ_lb)
+    # ∂K_ρ_ub/∂g = -Diag(ρ_ub)
+    # ∂K_power_bal/∂g = G_inc
+    @inbounds for j in 1:k
+        start_col!(idx.pg[j])
+        _push_csc_entry!(rowval, nzval, idx.pg[j], 2 * cq[j])
+        _push_csc_entry!(rowval, nzval, idx.rho_lb[j], rho_lb[j])
+        _push_csc_entry!(rowval, nzval, idx.rho_ub[j], -rho_ub[j])
+        for p in nzrange(G_inc, j)
+            _push_csc_entry!(rowval, nzval, idx.nu_bal[rowvals(G_inc)[p]], nonzeros(G_inc)[p])
+        end
+    end
 
-    # ∂K_f/∂...
-    # K_f = τ² * f - ν_flow - λ_lb + λ_ub
-    J[idx.f, idx.f] = net.tau^2 * I_m
-    J[idx.f, idx.lam_lb] = -I_m
-    J[idx.f, idx.lam_ub] = I_m
-    J[idx.f, idx.nu_flow] = -I_m
+    # f columns:
+    # ∂K_f/∂f = τ²*I
+    # ∂K_λ_lb/∂f = Diag(λ_lb)
+    # ∂K_λ_ub/∂f = -Diag(λ_ub)
+    # ∂K_flow_def/∂f = I
+    @inbounds for e in 1:m
+        start_col!(idx.f[e])
+        _push_csc_entry!(rowval, nzval, idx.f[e], tau^2)
+        _push_csc_entry!(rowval, nzval, idx.lam_lb[e], lam_lb[e])
+        _push_csc_entry!(rowval, nzval, idx.lam_ub[e], -lam_ub[e])
+        _push_csc_entry!(rowval, nzval, idx.nu_flow[e], 1.0)
+    end
 
-    # ∂K_psh/∂...
-    # K_psh = c_shed - ν_bal - μ_lb + μ_ub
-    J[idx.psh, idx.nu_bal] = -I_n
-    J[idx.psh, idx.mu_lb] = -I_n
-    J[idx.psh, idx.mu_ub] = I_n
+    # psh columns:
+    # ∂K_μ_lb/∂psh = Diag(μ_lb), except fixed zero-shed buses use I
+    # ∂K_μ_ub/∂psh = -Diag(μ_ub), except fixed zero-shed buses omit this term
+    # ∂K_power_bal/∂psh = I
+    @inbounds for i in 1:n
+        start_col!(idx.psh[i])
+        if _is_fixed_zero_shed(d[i])
+            _push_csc_entry!(rowval, nzval, idx.mu_lb[i], 1.0)
+        else
+            _push_csc_entry!(rowval, nzval, idx.mu_lb[i], mu_lb[i])
+            _push_csc_entry!(rowval, nzval, idx.mu_ub[i], -mu_ub[i])
+        end
+        _push_csc_entry!(rowval, nzval, idx.nu_bal[i], 1.0)
+    end
 
-    # ∂K_λ_lb/∂... (complementary slackness for lower flow bound)
-    # K_λ_lb = λ_lb .* (f + fmax)
-    J[idx.lam_lb, idx.f] = sparse(Diagonal(vars.lam_lb))
-    J[idx.lam_lb, idx.lam_lb] = sparse(Diagonal(vars.f .+ net.fmax))
+    # lambda columns:
+    # ∂K_f/∂λ_lb = -I
+    # ∂K_λ_lb/∂λ_lb = Diag(f + fmax)
+    # ∂K_f/∂λ_ub = I
+    # ∂K_λ_ub/∂λ_ub = Diag(fmax - f)
+    @inbounds for e in 1:m
+        start_col!(idx.lam_lb[e])
+        _push_csc_entry!(rowval, nzval, idx.f[e], -1.0)
+        _push_csc_entry!(rowval, nzval, idx.lam_lb[e], f[e] + fmax[e])
+    end
+    @inbounds for e in 1:m
+        start_col!(idx.lam_ub[e])
+        _push_csc_entry!(rowval, nzval, idx.f[e], 1.0)
+        _push_csc_entry!(rowval, nzval, idx.lam_ub[e], fmax[e] - f[e])
+    end
 
-    # ∂K_λ_ub/∂... (complementary slackness for upper flow bound)
-    # K_λ_ub = λ_ub .* (fmax - f)
-    J[idx.lam_ub, idx.f] = -sparse(Diagonal(vars.lam_ub))
-    J[idx.lam_ub, idx.lam_ub] = sparse(Diagonal(net.fmax .- vars.f))
+    # gamma columns:
+    # ∂K_θ/∂γ_lb = -A' * Diag(sw)
+    # ∂K_γ_lb/∂γ_lb = Diag(sw .* (A*θ - angmin))
+    # ∂K_θ/∂γ_ub = A' * Diag(sw)
+    # ∂K_γ_ub/∂γ_ub = Diag(sw .* (angmax - A*θ))
+    @inbounds for e in 1:m
+        start_col!(idx.gamma_lb[e])
+        for p in A_rowptr[e]:(A_rowptr[e + 1] - 1)
+            _push_csc_entry!(rowval, nzval, idx.va[A_rowcols[p]], -sw[e] * A_rowvals[p])
+        end
+        _push_csc_entry!(rowval, nzval, idx.gamma_lb[e], sw[e] * (Aθ[e] - angmin[e]))
+    end
+    @inbounds for e in 1:m
+        start_col!(idx.gamma_ub[e])
+        for p in A_rowptr[e]:(A_rowptr[e + 1] - 1)
+            _push_csc_entry!(rowval, nzval, idx.va[A_rowcols[p]], sw[e] * A_rowvals[p])
+        end
+        _push_csc_entry!(rowval, nzval, idx.gamma_ub[e], sw[e] * (angmax[e] - Aθ[e]))
+    end
 
-    # ∂K_γ_lb/∂... (complementary slackness for lower angle bound)
-    # K_γ_lb = γ_lb .* sw .* (A*θ - angmin)
-    Aθ = net.A * sol.va
-    J[idx.gamma_lb, idx.va] = Diagonal(vars.gamma_lb .* net.sw) * net.A
-    J[idx.gamma_lb, idx.gamma_lb] = sparse(Diagonal(net.sw .* (Aθ .- net.angmin)))
+    # rho columns:
+    # ∂K_g/∂ρ_lb = -I
+    # ∂K_ρ_lb/∂ρ_lb = Diag(g - gmin)
+    # ∂K_g/∂ρ_ub = I
+    # ∂K_ρ_ub/∂ρ_ub = Diag(gmax - g)
+    @inbounds for j in 1:k
+        start_col!(idx.rho_lb[j])
+        _push_csc_entry!(rowval, nzval, idx.pg[j], -1.0)
+        _push_csc_entry!(rowval, nzval, idx.rho_lb[j], pg[j] - gmin[j])
+    end
+    @inbounds for j in 1:k
+        start_col!(idx.rho_ub[j])
+        _push_csc_entry!(rowval, nzval, idx.pg[j], 1.0)
+        _push_csc_entry!(rowval, nzval, idx.rho_ub[j], gmax[j] - pg[j])
+    end
 
-    # ∂K_γ_ub/∂... (complementary slackness for upper angle bound)
-    # K_γ_ub = γ_ub .* sw .* (angmax - A*θ)
-    J[idx.gamma_ub, idx.va] = -Diagonal(vars.gamma_ub .* net.sw) * net.A
-    J[idx.gamma_ub, idx.gamma_ub] = sparse(Diagonal(net.sw .* (net.angmax .- Aθ)))
+    # mu columns:
+    # ∂K_psh/∂μ_lb = -I
+    # ∂K_μ_lb/∂μ_lb = Diag(psh), except fixed zero-shed buses omit this term
+    # ∂K_psh/∂μ_ub = I
+    # ∂K_μ_ub/∂μ_ub = Diag(d - psh), except fixed zero-shed buses use I
+    @inbounds for i in 1:n
+        start_col!(idx.mu_lb[i])
+        _push_csc_entry!(rowval, nzval, idx.psh[i], -1.0)
+        _is_fixed_zero_shed(d[i]) || _push_csc_entry!(rowval, nzval, idx.mu_lb[i], psh[i])
+    end
+    @inbounds for i in 1:n
+        start_col!(idx.mu_ub[i])
+        _push_csc_entry!(rowval, nzval, idx.psh[i], 1.0)
+        if _is_fixed_zero_shed(d[i])
+            _push_csc_entry!(rowval, nzval, idx.mu_ub[i], 1.0)
+        else
+            _push_csc_entry!(rowval, nzval, idx.mu_ub[i], d[i] - psh[i])
+        end
+    end
 
-    # ∂K_ρ_lb/∂... (complementary slackness for lower gen bound)
-    # K_ρ_lb = ρ_lb .* (g - gmin)
-    J[idx.rho_lb, idx.pg] = sparse(Diagonal(vars.rho_lb))
-    J[idx.rho_lb, idx.rho_lb] = sparse(Diagonal(vars.pg .- net.gmin))
+    # nu_bal columns:
+    # ∂K_θ/∂ν_bal = B'
+    # ∂K_g/∂ν_bal = -G_inc'
+    # ∂K_psh/∂ν_bal = -I
+    @inbounds for i in 1:n
+        start_col!(idx.nu_bal[i])
+        for p in nzrange(B_mat, i)
+            _push_csc_entry!(rowval, nzval, idx.va[rowvals(B_mat)[p]], nonzeros(B_mat)[p])
+        end
+        for p in G_rowptr[i]:(G_rowptr[i + 1] - 1)
+            _push_csc_entry!(rowval, nzval, idx.pg[G_rowcols[p]], -G_rowvals[p])
+        end
+        _push_csc_entry!(rowval, nzval, idx.psh[i], -1.0)
+    end
 
-    # ∂K_ρ_ub/∂... (complementary slackness for upper gen bound)
-    # K_ρ_ub = ρ_ub .* (gmax - g)
-    J[idx.rho_ub, idx.pg] = -sparse(Diagonal(vars.rho_ub))
-    J[idx.rho_ub, idx.rho_ub] = sparse(Diagonal(net.gmax .- vars.pg))
+    # nu_flow columns:
+    # ∂K_θ/∂ν_flow = (W*A)'
+    # ∂K_f/∂ν_flow = -I
+    @inbounds for e in 1:m
+        start_col!(idx.nu_flow[e])
+        for p in A_rowptr[e]:(A_rowptr[e + 1] - 1)
+            _push_csc_entry!(rowval, nzval, idx.va[A_rowcols[p]], -b[e] * sw[e] * A_rowvals[p])
+        end
+        _push_csc_entry!(rowval, nzval, idx.f[e], -1.0)
+    end
 
-    # ∂K_μ_lb/∂... (complementary slackness for lower shedding bound)
-    # K_μ_lb = μ_lb .* psh
-    J[idx.mu_lb, idx.psh] = sparse(Diagonal(vars.mu_lb))
-    J[idx.mu_lb, idx.mu_lb] = sparse(Diagonal(vars.psh))
+    # eta column:
+    # ∂K_θ/∂η = e_ref
+    start_col!(idx.η)
+    _push_csc_entry!(rowval, nzval, idx.va[ref_bus], 1.0)
+    colptr[dim + 1] = length(rowval) + 1
 
-    # ∂K_μ_ub/∂... (complementary slackness for upper shedding bound)
-    # K_μ_ub = μ_ub .* (d - psh)
-    J[idx.mu_ub, idx.psh] = -sparse(Diagonal(vars.mu_ub))
-    J[idx.mu_ub, idx.mu_ub] = sparse(Diagonal(d .- vars.psh))
-
-    # ∂K_power_bal/∂... (primal feasibility: power balance)
-    # K_power_bal = G_inc * g + psh - d - B * θ
-    J[idx.nu_bal, idx.va] = -B_mat
-    J[idx.nu_bal, idx.pg] = net.G_inc
-    J[idx.nu_bal, idx.psh] = I_n
-
-    # ∂K_flow_def/∂... (primal feasibility: flow definition)
-    # K_flow_def = f - WA * θ
-    J[idx.nu_flow, idx.va] = -WA
-    J[idx.nu_flow, idx.f] = I_m
-
-    # ∂K_ref/∂θ (reference bus)
-    J[idx.η, net.ref_bus] = 1.0
-
-    return J
+    return SparseMatrixCSC(dim, dim, colptr, rowval, nzval)
 end
 
 """
@@ -653,32 +822,41 @@ Compute the Jacobian of KKT conditions with respect to demand ∂K/∂d.
 Sparse matrix of size (kkt_dims × n).
 """
 function calc_kkt_jacobian_demand(net::DCNetwork, d::AbstractVector, sol::DCOPFSolution)
-    n, m, k = net.n, net.m, net.k
-    dim = kkt_dims(net)
+    n = getfield(net, :n)
+    m = getfield(net, :m)
+    k = getfield(net, :k)
+    dim = kkt_dims(n, m, k)
     idx = kkt_indices(n, m, k)
+    mu_ub = getfield(sol, :mu_ub)
 
-    J_d = spzeros(dim, n)
+    colptr = Vector{Int}(undef, n + 1)
+    rowval = Int[]
+    nzval = Float64[]
+    sizehint!(rowval, 2n)
+    sizehint!(nzval, 2n)
 
-    # ∂K_power_bal/∂d = -I (from K_power_bal = G_inc * g + psh - d - B * θ)
-    J_d[idx.nu_bal, :] = -sparse(I, n, n)
+    # ∂K_power_bal/∂d = -I and ∂K_μ_ub/∂d = Diag(μ_ub) for positive-demand buses.
+    @inbounds for i in 1:n
+        colptr[i] = length(rowval) + 1
+        _is_fixed_zero_shed(d[i]) || _push_csc_entry!(rowval, nzval, idx.mu_ub[i], mu_ub[i])
+        _push_csc_entry!(rowval, nzval, idx.nu_bal[i], -1.0)
+    end
+    colptr[n + 1] = length(rowval) + 1
 
-    # ∂K_μ_ub/∂d = Diag(μ_ub) (from K_μ_ub = μ_ub .* (d - psh))
-    J_d[idx.mu_ub, :] = sparse(Diagonal(sol.mu_ub))
-
-    return J_d
+    return SparseMatrixCSC(dim, n, colptr, rowval, nzval)
 end
 
 """
     calc_kkt_jacobian_demand_column(net, sol, j::Int) → Vector{Float64}
 
 Compute column `j` of the KKT parameter Jacobian ∂K/∂d.
-Only 2 nonzeros: `nu_bal[j]` and `mu_ub[j]`.
+Only 1-2 nonzeros: always `nu_bal[j]`, plus `mu_ub[j]` if `d[j] > 0`.
 """
-function calc_kkt_jacobian_demand_column(net::DCNetwork, sol::DCOPFSolution, j::Int)
+function calc_kkt_jacobian_demand_column(net::DCNetwork, d::AbstractVector, sol::DCOPFSolution, j::Int)
     col = zeros(kkt_dims(net))
     idx = kkt_indices(net)
     col[idx.nu_bal[j]] = -1.0
-    col[idx.mu_ub[j]] = sol.mu_ub[j]
+    _is_fixed_zero_shed(d[j]) || (col[idx.mu_ub[j]] = sol.mu_ub[j])
     return col
 end
 

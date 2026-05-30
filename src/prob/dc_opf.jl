@@ -19,7 +19,7 @@
 # Functions for solving DC OPF problems and updating parameters.
 
 # Threshold for snapping near-boundary primal/dual values to strict complementarity.
-# Interior-point solvers leave psh ≈ ε > 0 and gamma ≈ ε > 0 when a bound is active;
+# Interior point solvers leave psh ≈ ε > 0 and gamma ≈ ε > 0 when a bound is active;
 # snapping below this tolerance forces clean KKT structure.
 const COMPLEMENTARITY_SNAP_TOL = 1e-6
 
@@ -72,20 +72,17 @@ DCOPFSolution containing optimal primal and dual variables.
 Error if optimization does not converge to optimal/locally optimal solution.
 """
 function solve!(prob::DCOPFProblem)
-    # Invalidate sensitivity cache since we're re-solving
     invalidate!(prob.cache)
 
     optimize!(prob.model)
 
     _check_solve_status(prob.model, "DC OPF")
 
-    # Extract primal variables
     θ_val = value.(prob.va)
     g_val = value.(prob.pg)
     f_val = value.(prob.f)
     psh_val = value.(prob.psh)
 
-    # Extract dual variables
     # JuMP returns non-positive duals for <= constraints; negate to get standard
     # KKT duals (non-negative for inequality constraints).
     ν_bal = dual.(prob.cons.power_bal)
@@ -100,7 +97,7 @@ function solve!(prob::DCOPFProblem)
     γ_ub = -dual.(prob.cons.phase_diff_ub)
 
     # Post-process phase angle difference duals for strict complementarity.
-    # Interior-point solvers leave gamma ≈ 1e-8 for non-binding constraints.
+    # Interior point solvers leave gamma ≈ 1e-8 for non binding constraints.
     net = prob.network
     Atheta = net.A * θ_val
     TOL = COMPLEMENTARITY_SNAP_TOL
@@ -118,7 +115,7 @@ function solve!(prob::DCOPFProblem)
     end
 
     # Post-process load shedding for strict complementarity.
-    # Interior-point solvers give psh ≈ ε > 0 even when shedding is inactive.
+    # Interior point solvers give psh ≈ ε > 0 even when shedding is inactive.
     # Snap to strict complementarity for clean KKT sensitivity computation.
     d = prob.d
     for i in eachindex(psh_val)
@@ -128,7 +125,10 @@ function solve!(prob::DCOPFProblem)
         if abs(d[i]) < TOL
             # Degenerate: both bounds collapse to 0 ≤ psh ≤ 0
             psh_val[i] = 0.0
-            # Keep both duals from solver (both bounds active)
+            # Canonicalize the duplicate dual pair so the sensitivity KKT sees
+            # one effective lower-bound multiplier and a zero upper-bound dual.
+            μ_lb[i] -= μ_ub[i]
+            μ_ub[i] = 0.0
         elseif psh_val[i] < TOL
             # Lower bound active: psh = 0
             psh_val[i] = 0.0
@@ -163,10 +163,13 @@ end
 """
     update_demand!(prob::DCOPFProblem, d::AbstractVector)
 
-Update the demand parameter in the DC OPF problem.
+Rewrite the RHS of the power balance and shedding upper bound constraints to
+the new demand `d`, mutate `prob.d` in place, and invalidate the sensitivity
+cache. Avoids rebuilding the JuMP model.
 
-This modifies the RHS of power balance and shedding upper-bound constraints for re-solving with new demand.
-Invalidates the sensitivity cache since parameters have changed.
+To keep the JuMP constraints and the sensitivity cache consistent with the
+stored demand, always go through this function — do not mutate `prob.d` in
+place from the outside.
 """
 function update_demand!(prob::DCOPFProblem, d::AbstractVector)
     n = prob.network.n
@@ -174,16 +177,51 @@ function update_demand!(prob::DCOPFProblem, d::AbstractVector)
 
     _warn_negative_demand(d)
 
-    # Invalidate sensitivity cache since parameters changed
     invalidate!(prob.cache)
-
-    # Update stored demand
     prob.d .= d
-
-    # Update constraint RHS
     for i in 1:n
         set_normalized_rhs(prob.cons.power_bal[i], d[i])
         set_normalized_rhs(prob.cons.shed_ub[i], d[i])
+    end
+
+    return prob
+end
+
+"""
+    update_fmax!(prob::DCOPFProblem, fmax::AbstractVector)
+
+Rewrite the RHS of the `line_lb` (`f ≥ -fmax`) and `line_ub` (`f ≤ fmax`)
+constraints to the new branch flow limits `fmax`, mutate `prob.network.fmax`
+in place, and invalidate the sensitivity cache. Avoids rebuilding the JuMP
+model.
+
+`fmax` does not enter the reduced Laplacian factorization `b_r_factor`
+(which depends only on susceptances and switching states), so the cached
+factorization is preserved across the update.
+
+To keep the JuMP constraints and the sensitivity cache consistent with the
+stored limits, always go through this function — do not mutate
+`prob.network.fmax` in place from the outside.
+
+# Arguments
+- `prob`: DCOPFProblem to update
+- `fmax`: New flow limit vector (length m), non-negative per unit
+
+# Throws
+- `DimensionMismatch` if `length(fmax) != network.m`
+- `ArgumentError` if any entry of `fmax` is negative or NaN
+"""
+function update_fmax!(prob::DCOPFProblem, fmax::AbstractVector)
+    m = prob.network.m
+    length(fmax) == m || throw(DimensionMismatch("Flow limit vector length $(length(fmax)) must match number of branches $m"))
+    any(isnan, fmax) && throw(ArgumentError("Flow limits contain NaN"))
+    all(fmax .>= 0) || throw(ArgumentError("Flow limits must be non-negative; got $(fmax)"))
+
+    invalidate!(prob.cache)
+    prob.network.fmax .= fmax
+    for e in 1:m
+        set_normalized_rhs(prob.cons.line_lb[e], -fmax[e])
+        set_normalized_rhs(prob.cons.line_ub[e],  fmax[e])
     end
 
     return prob
