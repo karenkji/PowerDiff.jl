@@ -21,6 +21,8 @@ end
 case_name, net_data = _load_benchmark_case()
 prob = DCOPFProblem(net_data)
 sol = solve!(prob)
+ac_prob = ACOPFProblem(deepcopy(net_data); silent=true)
+ac_sol = solve!(ac_prob)
 
 SUITE["dc_opf"] = BenchmarkGroup()
 SUITE["dc_opf"]["kkt_jacobian"] = BenchmarkGroup()
@@ -31,3 +33,12 @@ kkt_suite["flowlimit"] = @benchmarkable PowerDiff.calc_kkt_jacobian_flowlimit($p
 kkt_suite["cost_linear"] = @benchmarkable PowerDiff.calc_kkt_jacobian_cost_linear($(prob.network))
 kkt_suite["cost_quadratic"] = @benchmarkable PowerDiff.calc_kkt_jacobian_cost_quadratic($prob, $sol)
 kkt_suite["susceptance"] = @benchmarkable PowerDiff.calc_kkt_jacobian_susceptance($prob, $sol)
+
+SUITE["ac_opf"] = BenchmarkGroup()
+SUITE["ac_opf"]["kkt_jacobian"] = BenchmarkGroup()
+SUITE["ac_opf"]["kkt_jacobian"][case_name] =
+    @benchmarkable PowerDiff.calc_kkt_jacobian($ac_prob; sol=$ac_sol)
+SUITE["ac_opf"]["kkt_param"] = BenchmarkGroup()
+SUITE["ac_opf"]["kkt_param"][case_name] = BenchmarkGroup()
+SUITE["ac_opf"]["kkt_param"][case_name]["switching"] =
+    @benchmarkable PowerDiff.calc_kkt_jacobian_param($ac_prob, $ac_sol, :sw)
