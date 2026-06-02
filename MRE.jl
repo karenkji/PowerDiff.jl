@@ -8,7 +8,6 @@ using Test
 using LinearAlgebra
 using SparseArrays
 using Statistics
-using Logging
 using PowerDiff
 using PowerModels
 using ForwardDiff
@@ -24,7 +23,6 @@ function main()
     d = PowerDiff.calc_demand_vector(net)
     dc_net = PowerDiff.DCNetwork(net)
     prob = PowerDiff.DCOPFProblem(dc_net, d)
-    println("START")
     try
         solve!(prob)
         println("OPF with PowerDiff succeeded.")
