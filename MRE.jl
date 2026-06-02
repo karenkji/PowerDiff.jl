@@ -1,5 +1,4 @@
-#MRE shown below. 
-# This MRE tests the basic functionality of PowerDiff by attempting to solve a DC OPF problem using PowerDiff. 
+# This MRE attempts to solve a DC OPF problem using PowerDiff. 
 # If PowerDiff fails, it falls back to solving the same problem using PowerModels to ensure that the issue is isolated to PowerDiff.
 # It provides two test cases: "RTS_GMLC.m" and "IEEE300.m". Comment out either/or to switch between them.
 # RTS should succeed with PowerDiff, while IEEE300 fails.
