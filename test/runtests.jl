@@ -43,10 +43,11 @@ include("common.jl")
         @test_skip false
     else
         dc_net = DCNetwork(net)
+        nd = PowerDiff._network_data(net)
 
-        @test dc_net.n == length(net["bus"])
-        @test dc_net.m == length(net["branch"])
-        @test dc_net.k == length(net["gen"])
+        @test dc_net.n == length(nd.bus)
+        @test dc_net.m == length(nd.branch)
+        @test dc_net.k == length(nd.gen)
         @test size(dc_net.A) == (dc_net.m, dc_net.n)
         @test size(dc_net.G_inc) == (dc_net.n, dc_net.k)
         @test length(dc_net.b) == dc_net.m
@@ -54,6 +55,23 @@ include("common.jl")
         @test length(dc_net.gmax) == dc_net.k
         @test dc_net.ref_bus >= 1 && dc_net.ref_bus <= dc_net.n
     end
+end
+
+# Regression: calc_demand_vector(::NamedTuple) must index by the sorted IDMapping,
+# not by file order, so demand lands on the right bus when bus IDs are unsorted.
+@testset "calc_demand_vector aligns with sorted IDMapping" begin
+    # Per-bus demand (loads already aggregated into bus pd); only bus_i and pd vary.
+    buses = [pd_bus(10, 1; pd=1.0), pd_bus(2, 1; pd=0.0), pd_bus(5, 1; pd=3.0)]
+    data = pd_case(buses, NamedTuple[], NamedTuple[]; name="unsorted")
+
+    d = calc_demand_vector(data)
+    id_map = PowerDiff.IDMapping(data)
+
+    # Sorted bus order is [2, 5, 10]; demand attaches per the IDMapping, not enumerate order.
+    @test d == [0.0, 3.0, 1.0]
+    @test d[id_map.bus_to_idx[10]] == 1.0
+    @test d[id_map.bus_to_idx[5]] == 3.0
+    @test d[id_map.bus_to_idx[2]] == 0.0
 end
 
 # Verify DCOPFProblem builds, solves, and satisfies basic feasibility.
@@ -312,8 +330,9 @@ end
 
         # Solve with our implementation
         # Use small τ for numerical stability in KKT system
-        dc_net = DCNetwork(net; tau=1e-3)
-        prob = DCOPFProblem(dc_net, calc_demand_vector(net))
+        typed = load_test_case("case5.m")
+        dc_net = DCNetwork(typed; tau=1e-3)
+        prob = DCOPFProblem(dc_net, calc_demand_vector(typed))
         sol = solve!(prob)
 
         # For LMPs, use the power balance duals directly (ν_bal)
@@ -735,9 +754,7 @@ end
         end
 
         # AC power flow on case14
-        pf_data = deepcopy(net)
-        PowerModels.compute_ac_pf!(pf_data)
-        state = ACPowerFlowState(pf_data)
+        state = load_ac_pf_state("case14.m")
 
         dvm_dp = calc_sensitivity(state, :vm, :p)
         dvm_dq = calc_sensitivity(state, :vm, :q)
@@ -852,6 +869,9 @@ include("test_kkt_vjp_jvp.jl")
 include("test_acpf_jacobian.jl")
 include("test_acpf_va_flow.jl")
 include("test_parameter_transforms.jl")
+include("test_parser_parity.jl")
+include("test_non_matpower_parsers.jl")
+include("test_ac_opf_exa_backend.jl")
 include("test_ac_opf_all_sens.jl")
 include("test_ac_topology_sens.jl")
 include("test_angle_diff_duals.jl")

@@ -125,7 +125,7 @@ B-θ formulation of DC OPF wrapped around a JuMP model.
 - `_optimizer`: Optimizer factory for model rebuilds (internal)
 - `_silent`: Whether to suppress solver output (internal)
 """
-mutable struct DCOPFProblem <: AbstractOPFProblem
+mutable struct DCOPFProblem{O} <: AbstractOPFProblem
     model::JuMP.Model
     network::DCNetwork
     va::Vector{VariableRef}
@@ -135,7 +135,7 @@ mutable struct DCOPFProblem <: AbstractOPFProblem
     d::Vector{Float64}
     cons::NamedTuple
     cache::DCSensitivityCache
-    _optimizer::Any
+    _optimizer::O
     _silent::Bool
 end
 
@@ -205,14 +205,13 @@ function _rebuild_jump_model!(prob::DCOPFProblem)
     # Create model
     model = JuMP.Model(prob._optimizer)
     prob._silent && set_silent(model)
-    # Tighten Ipopt tolerances for accurate dual recovery (needed by sensitivity analysis)
+    # Tighten Ipopt tolerances for accurate dual recovery (needed by sensitivity analysis).
     if _is_ipopt_optimizer(prob._optimizer)
         set_optimizer_attribute(model, "tol", 1e-10)
         set_optimizer_attribute(model, "acceptable_tol", 1e-8)
         set_optimizer_attribute(model, "max_cpu_time", 30.0)
     end
 
-    # Variables
     @variable(model, va[1:n])
     @variable(model, pg[1:k])
     @variable(model, f[1:m])
@@ -279,13 +278,12 @@ end
 
 Build a B-θ DC OPF problem from a DCNetwork.
 
-If `d` is not provided and the network was constructed from a PowerModels dict,
-demand is extracted from the stored `ref`.
+If `d` is not provided, demand is read from the network's typed cache.
 
 # Example
 ```julia
-net = DCNetwork(pm_data)
-prob = DCOPFProblem(net)       # demand extracted from stored ref
+net = DCNetwork(data)
+prob = DCOPFProblem(net)       # demand extracted from network data
 prob = DCOPFProblem(net; d=d)  # explicit demand
 ```
 """
@@ -297,17 +295,20 @@ function DCOPFProblem(network::DCNetwork; d::Union{Nothing,AbstractVector}=nothi
 end
 
 """
-    DCOPFProblem(net::Dict; d=nothing, kwargs...)
+    DCOPFProblem(pm_data::Dict; kwargs...)
 
-Convenience constructor: build DCOPFProblem directly from PowerModels dict.
-
-Accepts both basic and non-basic networks.
-If `d` is not provided, extracts demand from the network data.
+Reject the removed dictionary API with a migration hint.
 """
-function DCOPFProblem(net::Dict; d::Union{Nothing,AbstractVector}=nothing, tau::Float64=DEFAULT_TAU, kwargs...)
-    network = DCNetwork(net; tau=tau)
+function DCOPFProblem(pm_data::Dict{String,<:Any}; kwargs...)
+    throw(ArgumentError("dictionary constructors were removed; parse a network file with PowerDiff.parse_file"))
+end
+
+DCOPFProblem(net::PowerIO.Network; kwargs...) = DCOPFProblem(_network_data(net); kwargs...)
+
+function DCOPFProblem(data::NamedTuple; d::Union{Nothing,AbstractVector}=nothing, tau::Float64=DEFAULT_TAU, kwargs...)
+    network = DCNetwork(data; tau=tau)
     if isnothing(d)
-        d = _calc_demand_vector(network.ref, network.id_map)
+        d = calc_demand_vector(network)
     end
     return DCOPFProblem(network, d; kwargs...)
 end

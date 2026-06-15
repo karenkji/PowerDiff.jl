@@ -6,12 +6,15 @@ This guide walks through the main workflows: DC power flow, DC OPF with LMP anal
 
 ```julia
 using PowerDiff
-using PowerModels
 
-# Load a MATPOWER case (make_basic_network is optional)
-net = PowerModels.parse_file("case14.m")
-# OR: net = PowerModels.make_basic_network(raw)  # sequential IDs
+# Parse a supported PowerIO case into a PowerIO.Network
+net = parse_file("case14.m")
 ```
+
+PowerDiff reads files through PowerIO. `parse_file` supports MATPOWER `.m`,
+PSS/E `.raw`, PowerWorld `.aux`, PowerModels JSON, and Egret JSON. For streams,
+pass `from`; JSON streams need `from=:egret` or `from=:powermodels`. The former
+PowerModels dictionary constructors were removed.
 
 ## Interactive Exploration
 
@@ -109,11 +112,13 @@ sens * ones(size(sens,2)) # matrix-vector product
 
 ## AC Power Flow
 
-AC power flow sensitivities require a solved AC power flow solution.
+AC power flow sensitivities require complex bus voltages from an external AC
+power flow solve.
 
 ```julia
-PowerModels.compute_ac_pf!(net)
-ac_state = ACPowerFlowState(net)
+ac_net = ACNetwork(net)
+v = external_solver_voltage_vector
+ac_state = ACPowerFlowState(ac_net, v)
 
 # Voltage and current sensitivities
 dvm_dp = calc_sensitivity(ac_state, :vm, :p)   # d|V|/dp (n x n)
