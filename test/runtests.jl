@@ -883,7 +883,7 @@ include("test_sensitivity_column.jl")
 
 include("unified/test_sensitivity_verification.jl")
 
-include("test_apf_integration.jl")
+include("test_dcpf_factorization.jl")
 
 # =============================================================================
 # silence() tests (must be last — resets _SILENCE_WARNINGS flag)
