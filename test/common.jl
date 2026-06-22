@@ -20,9 +20,8 @@
 # which defines its own load_test_case inline).
 #
 # Data loaders:
-#   load_test_case  — parse MATPOWER case from PowerModels' bundled test data,
-#                     returns a basic (sequentially-renumbered) network dict
-#   load_raw_case   — same, but returns the raw (non-basic) network dict
+#   load_test_case  — parse a MATPOWER case into a PowerIO.Network (via PowerDiff.parse_file)
+#   load_pm_case    — parse a PowerModels dictionary for oracle comparisons only
 #
 # Programmatic networks:
 #   create_2bus_network          — minimal 2-bus DC network with known closed-form solution
@@ -48,20 +47,31 @@ using ForwardDiff
 using Ipopt
 using JuMP: MOI
 
-# PowerModels test data directory
+# PowerModels test data directory and PowerDiff-owned PGLib artifact handle
 const PM_DATA_DIR = joinpath(dirname(pathof(PowerModels)), "..", "test", "data", "matpower")
+const PD_PGLIB_DIR = PowerDiff.get_path(:pglib)
+
+# Build PowerDiff network tables (the NamedTuple that DCNetwork/ACNetwork consume,
+# see PowerDiff._network_data) directly, for programmatic test networks. Values are
+# taken as-is — already normalized — like the removed hand-built ParsedCase path.
+pd_bus(bus_i, bus_type; pd=0.0, qd=0.0, gs=0.0, bs=0.0, vm=1.0, va=0.0, vmin=0.9, vmax=1.1) =
+    (; bus_i, bus_type, pd, qd, gs, bs, vm, va, vmin, vmax)
+pd_gen(index, gen_bus; pg=0.0, qg=0.0, qmin=0.0, qmax=0.0, vg=1.0, pmin=0.0, pmax=0.0, cost=(0.0, 0.0, 0.0)) =
+    (; index, gen_bus, pg, qg, qmin, qmax, vg, pmin, pmax, cost)
+pd_branch(index, f_bus, t_bus; br_r, br_x, br_b=0.0, rate_a=Inf, rate_b=0.0, rate_c=0.0,
+          tap=1.0, shift=0.0, angmin=-pi / 3, angmax=pi / 3) =
+    (; index, f_bus, t_bus, br_r, br_x, br_b, rate_a, rate_b, rate_c, tap, shift, angmin, angmax)
+pd_case(bus, gen, branch; name="case", baseMVA=100.0) = (; name, baseMVA, bus, gen, branch)
 
 """
     load_test_case(case_name::String)
 
-Load and prepare a PowerModels test case.
-Returns a basic network dictionary or nothing if not found.
+Load a PowerModels test fixture through `PowerDiff.parse_file`, returning a `PowerIO.Network`.
 """
 function load_test_case(case_name::String)
     case_path = joinpath(PM_DATA_DIR, case_name)
     if isfile(case_path)
-        raw = PowerModels.parse_file(case_path)
-        return PowerModels.make_basic_network(raw)
+        return PowerDiff.parse_file(case_path)
     else
         @warn "Test case not found: $case_path"
         return nothing
@@ -69,17 +79,38 @@ function load_test_case(case_name::String)
 end
 
 """
-    load_raw_case(case_name::String)
+    load_pm_case(case_name::String; basic=false)
 
-Load a raw (non-basic) PowerModels network.
+Load a PowerModels dictionary for oracle comparisons.
 """
-function load_raw_case(case_name::String)
+function load_pm_case(case_name::String; basic::Bool=false)
     case_path = joinpath(PM_DATA_DIR, case_name)
     if isfile(case_path)
-        return PowerModels.parse_file(case_path)
+        data = PowerModels.parse_file(case_path)
+        return basic ? PowerModels.make_basic_network(data) : data
     else
         return nothing
     end
+end
+
+load_raw_case(case_name::String) = load_pm_case(case_name)
+
+"""
+    load_ac_pf_state(case_name::String)
+
+Solve an AC power flow with PowerModels, then wrap the resulting voltage vector
+in PowerDiff's typed AC network representation.
+"""
+function load_ac_pf_state(case_name::String)
+    data = load_test_case(case_name)
+    pm_data = load_pm_case(case_name; basic=true)
+    if isnothing(data) || isnothing(pm_data)
+        return nothing
+    end
+
+    PowerModels.compute_ac_pf!(pm_data)
+    v = PowerModels.calc_basic_bus_voltage(pm_data)
+    return ACPowerFlowState(ACNetwork(data), v)
 end
 
 """

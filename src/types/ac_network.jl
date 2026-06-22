@@ -25,14 +25,9 @@
 AC network data with vectorized admittance representation.
 
 Provides a unified interface for AC power flow and sensitivity analysis,
-analogous to `DCNetwork` for DC formulations. Uses edge-based conductance
-and susceptance vectors for differentiable admittance matrix construction.
-
-The admittance matrix is reconstructed as:
-    Y = A' * Diag(g + j*b) * A + Diag(g_shunt + j*b_shunt)
-
-For switching-aware formulation:
-    Y(sw) = A' * Diag((g + j*b) .* sw) * A + Diag(g_shunt + j*b_shunt)
+analogous to `DCNetwork` for DC formulations. Each branch contributes its
+from/from, from/to, to/from, and to/to pi-model coefficients, including line
+charging, transformer taps, phase shifts, switching, and parallel lines.
 
 # Fields
 - `n`: Number of buses
@@ -41,15 +36,14 @@ For switching-aware formulation:
 - `incidences`: Edge list [(i,j), ...] for each branch (sequential indices)
 - `g`: Branch conductances
 - `b`: Branch susceptances (note: typically negative for inductive lines)
-- `g_shunt`: Shunt conductances per bus (from shunts + line charging)
+- `g_shunt`: Shunt conductances per bus
 - `b_shunt`: Shunt susceptances per bus
 - `sw`: Branch switching states ∈ [0,1]^m
 - `is_switchable`: Which branches can be switched
 - `idx_slack`: Slack bus index (sequential)
 - `vm_min`, `vm_max`: Voltage magnitude limits per bus
-- `i_max`: Branch current magnitude limits
 - `id_map`: Bidirectional mapping between original and sequential element IDs
-- `ref`: PowerModels build_ref dictionary (nothing for Y-matrix constructors)
+- typed branch, bus, and generator arrays used by PF/OPF constructors
 """
 struct ACNetwork <: AbstractPowerNetwork
     # Dimensions
@@ -76,13 +70,45 @@ struct ACNetwork <: AbstractPowerNetwork
     # Limits
     vm_min::Vector{Float64}
     vm_max::Vector{Float64}
-    i_max::Vector{Float64}
 
     # ID mapping
     id_map::IDMapping
 
-    # PowerModels reference (nothing for Y-matrix constructors)
-    ref::Union{Nothing,Dict}
+    # Branch parameters
+    f_bus::Vector{Int}
+    t_bus::Vector{Int}
+    br_r::Vector{Float64}
+    br_x::Vector{Float64}
+    br_b::Vector{Float64}
+    g_fr::Vector{Float64}
+    b_fr::Vector{Float64}
+    g_to::Vector{Float64}
+    b_to::Vector{Float64}
+    tap::Vector{Float64}
+    shift::Vector{Float64}
+    tm::Vector{Float64}
+    angmin::Vector{Float64}
+    angmax::Vector{Float64}
+    rate_a::Vector{Float64}
+
+    # Bus injections and shunts
+    pd::Vector{Float64}
+    qd::Vector{Float64}
+    gs::Vector{Float64}
+    bs::Vector{Float64}
+
+    # Generator data
+    pg::Vector{Float64}
+    qg::Vector{Float64}
+    gen_bus::Vector{Int}
+    pmin::Vector{Float64}
+    pmax::Vector{Float64}
+    qmin::Vector{Float64}
+    qmax::Vector{Float64}
+    cq::Vector{Float64}
+    cl::Vector{Float64}
+    cc::Vector{Float64}
+    ref_bus_keys::Vector{Int}
 end
 
 # =============================================================================
@@ -95,8 +121,8 @@ end
 AC power flow solution with full injection tracking.
 
 Provides a common interface for AC sensitivity computations, analogous to
-`DCPowerFlowState` for DC power flow. Can be constructed from a PowerModels
-network or from raw voltage/admittance data.
+`DCPowerFlowState` for DC power flow. Can be constructed from an `ACNetwork`
+and externally solved voltages, or from raw voltage/admittance data.
 
 # Fields
 - `net`: ACNetwork reference (optional, provides access to edge-level data)
@@ -108,7 +134,7 @@ network or from raw voltage/admittance data.
 - `pd`: Real power demand per bus
 - `qg`: Reactive power generation per bus
 - `qd`: Reactive power demand per bus
-- `branch_data`: Branch dictionary with sequential indices (required for :im sensitivity)
+- `branch_data`: Optional branch dictionary for raw voltage/admittance states
 - `idx_slack`: Index of the slack (reference) bus
 - `n`: Number of buses
 - `m`: Number of branches
@@ -116,7 +142,6 @@ network or from raw voltage/admittance data.
 # Constructors
 - `ACPowerFlowState(v, Y; ...)`: From voltage phasors and admittance matrix
 - `ACPowerFlowState(net::ACNetwork, v; ...)`: From ACNetwork and voltage solution
-- `ACPowerFlowState(pm_net::Dict)`: From solved PowerModels network
 """
 struct ACPowerFlowState <: AbstractPowerFlowState
     net::Union{ACNetwork, Nothing}
@@ -176,111 +201,145 @@ end
 """
     ACNetwork(net::Dict; idx_slack=nothing)
 
-Construct ACNetwork from a PowerModels network dictionary.
-
-Accepts both basic and non-basic networks. Non-basic networks (with arbitrary
-bus/branch/gen IDs) are automatically translated to sequential indices internally.
-The original IDs are preserved in `id_map` for result interpretation.
-
-The `build_ref` result is stored on the network for reuse by downstream
-constructors (e.g. `ACOPFProblem`, `ACPowerFlowState`), avoiding redundant
-`deepcopy` + `build_ref` calls.
-
-# Arguments
-- `net`: PowerModels network dictionary (basic or non-basic)
-- `idx_slack`: Slack bus index (if not specified, uses reference bus from data)
+Reject the removed dictionary API with a migration hint.
 """
 function ACNetwork(net::Dict{String,<:Any}; idx_slack::Union{Nothing,Int}=nothing)
-    pm_data, ref, id_map = _prepare_network_data(net)
+    throw(ArgumentError("dictionary constructors were removed; parse a network file with PowerDiff.parse_file"))
+end
 
+ACNetwork(net::PowerIO.Network; idx_slack::Union{Nothing,Int}=nothing) =
+    ACNetwork(_network_data(net); idx_slack=idx_slack)
+
+# Build from PowerDiff network tables (see `_network_data`). The `PowerIO.Network`
+# method runs PowerDiff's modeling deltas; this assumes the tables are already
+# normalized, so programmatic callers can supply ready values directly.
+function ACNetwork(data::NamedTuple; idx_slack::Union{Nothing,Int}=nothing)
+    id_map = IDMapping(data)
     n_bus = length(id_map.bus_ids)
     n_branch = length(id_map.branch_ids)
+    n_gen = length(id_map.gen_ids)
+    bus_tbl = Dict(bus.bus_i => bus for bus in data.bus)
+    branch_tbl = Dict(branch.index => branch for branch in data.branch)
+    gen_tbl = Dict(gen.index => gen for gen in data.gen)
 
-    # Build incidence matrix and edge list
     A = spzeros(n_branch, n_bus)
     incidences = Vector{Tuple{Int,Int}}(undef, n_branch)
-
-    for (orig_id, br) in ref[:branch]
-        ix = id_map.branch_to_idx[orig_id]
-        f_idx = id_map.bus_to_idx[br["f_bus"]]
-        t_idx = id_map.bus_to_idx[br["t_bus"]]
-        A[ix, f_idx] = 1.0
-        A[ix, t_idx] = -1.0
-        incidences[ix] = (f_idx, t_idx)
-    end
-
-    # Compute individual branch admittances from impedance
+    f_bus = Vector{Int}(undef, n_branch)
+    t_bus = Vector{Int}(undef, n_branch)
+    br_r = Vector{Float64}(undef, n_branch)
+    br_x = Vector{Float64}(undef, n_branch)
+    br_b = Vector{Float64}(undef, n_branch)
+    g_fr = zeros(n_branch)
+    b_fr = Vector{Float64}(undef, n_branch)
+    g_to = zeros(n_branch)
+    b_to = Vector{Float64}(undef, n_branch)
+    tap = Vector{Float64}(undef, n_branch)
+    shift = Vector{Float64}(undef, n_branch)
+    tm = Vector{Float64}(undef, n_branch)
+    angmin = Vector{Float64}(undef, n_branch)
+    angmax = Vector{Float64}(undef, n_branch)
+    rate_a = Vector{Float64}(undef, n_branch)
     g = zeros(n_branch)
     b = zeros(n_branch)
 
-    for (orig_id, br) in ref[:branch]
-        ix = id_map.branch_to_idx[orig_id]
-        r = br["br_r"]
-        x = br["br_x"]
-
-        # Branch admittance: y = 1/(r + jx) = (r - jx)/(r² + x²)
-        z2 = r^2 + x^2
+    for orig_id in id_map.branch_ids
+        branch = branch_tbl[orig_id]
+        l = id_map.branch_to_idx[orig_id]
+        fb = id_map.bus_to_idx[branch.f_bus]
+        tb = id_map.bus_to_idx[branch.t_bus]
+        A[l, fb] = 1.0
+        A[l, tb] = -1.0
+        incidences[l] = (fb, tb)
+        f_bus[l] = fb
+        t_bus[l] = tb
+        br_r[l] = branch.br_r
+        br_x[l] = branch.br_x
+        br_b[l] = branch.br_b
+        # MATPOWER models line charging as a single symmetric susceptance with no
+        # charging conductance, and `_network_data` already folded the two PowerIO
+        # sides into `br_b`. Split it evenly and leave g_fr/g_to at zero (initialized
+        # above). Asymmetric b_fr != b_to or nonzero g_fr/g_to from a non MATPOWER
+        # source would be averaged/dropped here; thread the per-side values through
+        # if that fidelity is ever needed.
+        b_fr[l] = branch.br_b / 2
+        b_to[l] = branch.br_b / 2
+        tap[l] = iszero(branch.tap) ? 1.0 : branch.tap
+        shift[l] = branch.shift
+        tm[l] = tap[l]^2
+        angmin[l] = branch.angmin
+        angmax[l] = branch.angmax
+        rate_a[l] = branch.rate_a
+        z2 = branch.br_r^2 + branch.br_x^2
         if z2 > 1e-10
-            g[ix] = r / z2
-            b[ix] = -x / z2
+            g[l] = branch.br_r / z2
+            b[l] = -branch.br_x / z2
         else
-            _SILENCE_WARNINGS[] || @warn "Branch $(orig_id) has near-zero impedance (|z|² = $(z2)); treating as open (zero admittance)."
+            _SILENCE_WARNINGS[] || @warn "Branch $orig_id has near-zero impedance; treating as open."
         end
     end
-
-    # Shunt admittances: use PM.calc_admittance_matrix to get the full Y matrix,
-    # then extract shunts from diagonal minus branch contributions
-    am = PM.calc_admittance_matrix(pm_data)
 
     g_shunt = zeros(n_bus)
     b_shunt = zeros(n_bus)
+    pd = zeros(n_bus)
+    qd = zeros(n_bus)
+    gs = zeros(n_bus)
+    bs = zeros(n_bus)
+    # to_powerdata aggregates loads/shunts into per-bus values (per-unit).
+    for bus in data.bus
+        i = id_map.bus_to_idx[bus.bus_i]
+        pd[i] += bus.pd
+        qd[i] += bus.qd
+        gs[i] += bus.gs
+        bs[i] += bus.bs
+        g_shunt[i] += bus.gs
+        b_shunt[i] += bus.bs
+    end
 
-    for i in 1:n_bus
-        orig_bus_id = id_map.bus_ids[i]
-        # Find PM's internal index for this bus
-        pm_idx = am.bus_to_idx[orig_bus_id]
+    pg = zeros(n_bus)
+    qg = zeros(n_bus)
+    gen_bus = Vector{Int}(undef, n_gen)
+    pmin = Vector{Float64}(undef, n_gen)
+    pmax = Vector{Float64}(undef, n_gen)
+    qmin = Vector{Float64}(undef, n_gen)
+    qmax = Vector{Float64}(undef, n_gen)
+    cq = Vector{Float64}(undef, n_gen)
+    cl = Vector{Float64}(undef, n_gen)
+    cc = Vector{Float64}(undef, n_gen)
+    for orig_id in id_map.gen_ids
+        gen = gen_tbl[orig_id]
+        j = id_map.gen_to_idx[orig_id]
+        i = id_map.bus_to_idx[gen.gen_bus]
+        gen_bus[j] = i
+        pg[i] += gen.pg
+        qg[i] += gen.qg
+        pmin[j] = gen.pmin
+        pmax[j] = gen.pmax
+        qmin[j] = gen.qmin
+        qmax[j] = gen.qmax
+        cq[j], cl[j], cc[j] = gen.cost
+    end
 
-        # Y_ii = sum of all admittances connected to bus i
-        y_sum = am.matrix[pm_idx, pm_idx]
-
-        # Subtract branch contributions
-        for (orig_br_id, br) in ref[:branch]
-            br_idx = id_map.branch_to_idx[orig_br_id]
-            if br["f_bus"] == orig_bus_id || br["t_bus"] == orig_bus_id
-                y_sum -= g[br_idx] + im * b[br_idx]
-            end
+    if !isnothing(idx_slack)
+        1 <= idx_slack <= n_bus || throw(ArgumentError(
+            "idx_slack=$idx_slack is not a valid bus index (1:$n_bus)"))
+        ref_bus_keys = [idx_slack]
+    else
+        ref_bus_keys = [id_map.bus_to_idx[id] for id in id_map.bus_ids if bus_tbl[id].bus_type == 3]
+        if isempty(ref_bus_keys)
+            _SILENCE_WARNINGS[] || @warn "No reference bus (type 3) in the network; defaulting to bus 1 as slack. Pass `idx_slack` to choose explicitly."
+            push!(ref_bus_keys, 1)
         end
-
-        g_shunt[i] = real(y_sum)
-        b_shunt[i] = imag(y_sum)
+        idx_slack = first(ref_bus_keys)
     end
-
-    # All branches active by default
-    sw = ones(n_branch)
-    is_switchable = trues(n_branch)
-
-    # Find slack bus
-    if isnothing(idx_slack)
-        orig_ref = first(keys(ref[:ref_buses]))
-        idx_slack = id_map.bus_to_idx[orig_ref]
-    end
-
-    # Voltage limits (iterate in sequential order)
-    vm_min = [get(ref[:bus][id_map.bus_ids[i]], "vmin", 0.9) for i in 1:n_bus]
-    vm_max = [get(ref[:bus][id_map.bus_ids[i]], "vmax", 1.1) for i in 1:n_bus]
-
-    # Current limits (from rate_a if available)
-    i_max = [get(ref[:branch][id_map.branch_ids[i]], "rate_a", Inf) for i in 1:n_branch]
+    vm_min = [bus_tbl[id].vmin for id in id_map.bus_ids]
+    vm_max = [bus_tbl[id].vmax for id in id_map.bus_ids]
 
     return ACNetwork(
-        n_bus, n_branch,
-        sparse(A), incidences,
-        g, b, g_shunt, b_shunt,
-        sw, is_switchable,
-        idx_slack,
-        vm_min, vm_max, i_max,
-        id_map,
-        ref
+        n_bus, n_branch, sparse(A), incidences, g, b, g_shunt, b_shunt,
+        ones(n_branch), trues(n_branch), idx_slack, vm_min, vm_max,
+        id_map, f_bus, t_bus, br_r, br_x, br_b, g_fr, b_fr, g_to, b_to,
+        tap, shift, tm, angmin, angmax, rate_a, pd, qd, gs, bs, pg, qg,
+        gen_bus, pmin, pmax, qmin, qmax, cq, cl, cc, ref_bus_keys
     )
 end
 
@@ -290,7 +349,7 @@ end
 Construct ACNetwork from a complex admittance matrix.
 
 Extracts edge-based representation from the full admittance matrix.
-Useful for direct construction without PowerModels.
+Useful for direct construction from a raw admittance matrix.
 """
 function ACNetwork(Y::AbstractMatrix{<:Complex}; idx_slack::Int=1)
     n = size(Y, 1)
@@ -334,17 +393,20 @@ function ACNetwork(Y::AbstractMatrix{<:Complex}; idx_slack::Int=1)
     is_switchable = trues(m)
     vm_min = fill(0.9, n)
     vm_max = fill(1.1, n)
-    i_max = fill(Inf, m)
-
     return ACNetwork(
         n, m,
         A, edges,
         g, b, g_shunt, b_shunt,
         sw, is_switchable,
         idx_slack,
-        vm_min, vm_max, i_max,
-        IDMapping(n, m, 0, 0),
-        nothing
+        vm_min, vm_max,
+        IDMapping(n, m, 0),
+        [edge[1] for edge in edges], [edge[2] for edge in edges],
+        zeros(m), zeros(m), zeros(m), zeros(m), zeros(m), zeros(m), zeros(m),
+        ones(m), zeros(m), ones(m), fill(-π, m), fill(π, m), fill(Inf, m),
+        zeros(n), zeros(n), zeros(n), zeros(n),
+        zeros(n), zeros(n), Int[], Float64[], Float64[], Float64[],
+        Float64[], Float64[], Float64[], Float64[], [idx_slack]
     )
 end
 
@@ -359,10 +421,7 @@ Reconstruct the bus admittance matrix Y from vectorized representation.
 
     Y = A' * Diag(g + j*b) * A + Diag(g_shunt + j*b_shunt)
 """
-function admittance_matrix(net::ACNetwork)
-    W = Diagonal(net.g .+ im .* net.b)
-    return transpose(net.A) * W * net.A + Diagonal(net.g_shunt .+ im .* net.b_shunt)
-end
+admittance_matrix(net::ACNetwork) = admittance_matrix(net, net.sw)
 
 """
     admittance_matrix(net::ACNetwork, sw::AbstractVector) → SparseMatrixCSC{ComplexF64}
@@ -372,8 +431,36 @@ Reconstruct admittance matrix with switching states.
     Y(sw) = A' * Diag((g + j*b) .* sw) * A + Diag(g_shunt + j*b_shunt)
 """
 function admittance_matrix(net::ACNetwork, sw::AbstractVector)
-    W = Diagonal((net.g .+ im .* net.b) .* sw)
-    return transpose(net.A) * W * net.A + Diagonal(net.g_shunt .+ im .* net.b_shunt)
+    length(sw) == net.m || throw(DimensionMismatch("switching vector must have length $(net.m)"))
+    rows = collect(1:net.n)
+    cols = collect(1:net.n)
+    vals = ComplexF64.(net.g_shunt .+ im .* net.b_shunt)
+    sizehint!(rows, net.n + 4net.m)
+    sizehint!(cols, net.n + 4net.m)
+    sizehint!(vals, net.n + 4net.m)
+    for l in 1:net.m
+        yff, yft, ytf, ytt = _branch_admittance_coefficients(net, l)
+        fb, tb = net.f_bus[l], net.t_bus[l]
+        append!(rows, (fb, fb, tb, tb))
+        append!(cols, (fb, tb, fb, tb))
+        append!(vals, sw[l] .* (yff, yft, ytf, ytt))
+    end
+    return sparse(rows, cols, vals, net.n, net.n)
+end
+
+@inline function _branch_admittance_coefficients(net::ACNetwork, l::Int)
+    y = net.g[l] + im * net.b[l]
+    tap = net.tap[l] * cis(net.shift[l])
+    yff = (y + net.g_fr[l] + im * net.b_fr[l]) / abs2(tap)
+    yft = -y / conj(tap)
+    ytf = -y / tap
+    ytt = y + net.g_to[l] + im * net.b_to[l]
+    return yff, yft, ytf, ytt
+end
+
+@inline function _branch_current_coefficients(net::ACNetwork, l::Int)
+    yff, yft, _, _ = _branch_admittance_coefficients(net, l)
+    return net.sw[l] * yff, net.sw[l] * yft
 end
 
 # =============================================================================
@@ -435,22 +522,25 @@ q_polar(net::ACNetwork, vm::AbstractVector, δ::AbstractVector) =
 """
     branch_current(net::ACNetwork, v::AbstractVector{<:Complex}) → Vector{ComplexF64}
 
-Complex branch currents: I_branch = Diag(y) * A * v
+Complex branch currents injected from the from-side bus.
 """
 function branch_current(net::ACNetwork, v::AbstractVector{<:Complex})
-    W = Diagonal(net.g .+ im .* net.b)
-    return W * net.A * v
+    return [
+        let (yff, yft) = _branch_current_coefficients(net, l)
+            yff * v[net.f_bus[l]] + yft * v[net.t_bus[l]]
+        end
+        for l in 1:net.m
+    ]
 end
 
 """
     branch_power(net::ACNetwork, v::AbstractVector{<:Complex}) → Vector{ComplexF64}
 
-Complex branch power flows: S_branch = diag(A*v) * conj(I_branch)
+Complex branch power flows injected from the from-side bus.
 """
 function branch_power(net::ACNetwork, v::AbstractVector{<:Complex})
     I = branch_current(net, v)
-    ΔV = net.A * v  # Voltage difference across each branch
-    return ΔV .* conj.(I)
+    return v[net.f_bus] .* conj.(I)
 end
 
 # =============================================================================
@@ -467,7 +557,7 @@ Construct ACPowerFlowState from ACNetwork and voltage solution.
 - `v`: Complex voltage phasors from power flow solution
 
 # Keyword Arguments
-- `pg`, `pd`, `qg`, `qd`: Generation and demand vectors (default to zeros)
+- `pg`, `pd`, `qg`, `qd`: Generation and demand vectors (default to network values)
 """
 function ACPowerFlowState(
     net::ACNetwork,
@@ -483,11 +573,10 @@ function ACPowerFlowState(
     # Build admittance matrix from network
     Y = admittance_matrix(net)
 
-    # Default to zeros if not provided
-    pg_vec = isnothing(pg) ? zeros(n) : pg
-    pd_vec = isnothing(pd) ? zeros(n) : pd
-    qg_vec = isnothing(qg) ? zeros(n) : qg
-    qd_vec = isnothing(qd) ? zeros(n) : qd
+    pg_vec = isnothing(pg) ? copy(net.pg) : pg
+    pd_vec = isnothing(pd) ? copy(net.pd) : pd
+    qg_vec = isnothing(qg) ? copy(net.qg) : qg
+    qd_vec = isnothing(qd) ? copy(net.qd) : qd
 
     p_net = pg_vec - pd_vec
     q_net = qg_vec - qd_vec
@@ -503,76 +592,10 @@ end
 """
     ACPowerFlowState(pm_net::Dict)
 
-Construct ACPowerFlowState from a solved PowerModels network.
-
-Accepts both basic and non-basic networks. Extracts voltage solution and
-injection data. Creates an ACNetwork internally for access to edge-level data.
-The network must have a solved power flow.
+Reject the removed dictionary API with a migration hint.
 """
 function ACPowerFlowState(pm_net::Dict)
-    # Create ACNetwork from the PowerModels data (handles basic/non-basic, stores ref)
-    net = ACNetwork(pm_net)
-    id_map = net.id_map
-    ref = net.ref  # Reuse stored ref — no extra build_ref
-
-    n = net.n
-    m = net.m
-
-    # Extract bus voltages in sequential order
-    v = Vector{ComplexF64}(undef, n)
-    for i in 1:n
-        orig_id = id_map.bus_ids[i]
-        bus = ref[:bus][orig_id]
-        vm_val = get(bus, "vm", 1.0)
-        va_val = get(bus, "va", 0.0)
-        v[i] = vm_val * cis(va_val)
-    end
-
-    Y = admittance_matrix(net)
-
-    # Extract generation and demand in sequential bus order
-    pg = zeros(n)
-    qg = zeros(n)
-    for (orig_id, gen_ids) in ref[:bus_gens]
-        bus_idx = id_map.bus_to_idx[orig_id]
-        for gen_id in gen_ids
-            gen = ref[:gen][gen_id]
-            pg[bus_idx] += get(gen, "pg", 0.0)
-            qg[bus_idx] += get(gen, "qg", 0.0)
-        end
-    end
-
-    pd = zeros(n)
-    qd = zeros(n)
-    for (orig_id, load_ids) in ref[:bus_loads]
-        bus_idx = id_map.bus_to_idx[orig_id]
-        for load_id in load_ids
-            load = ref[:load][load_id]
-            pd[bus_idx] += get(load, "pd", 0.0)
-            qd[bus_idx] += get(load, "qd", 0.0)
-        end
-    end
-
-    p_net = pg - pd
-    q_net = qg - qd
-
-    # Build branch_data with sequential indices for current sensitivity
-    seq_branch = Dict{String,Any}()
-    for (orig_id, br) in ref[:branch]
-        seq_idx = id_map.branch_to_idx[orig_id]
-        seq_br = copy(br)
-        seq_br["index"] = seq_idx
-        seq_br["f_bus"] = id_map.bus_to_idx[br["f_bus"]]
-        seq_br["t_bus"] = id_map.bus_to_idx[br["t_bus"]]
-        seq_branch[string(seq_idx)] = seq_br
-    end
-
-    return ACPowerFlowState(
-        net, v, Y,
-        p_net, q_net,
-        pg, pd, qg, qd,
-        seq_branch, net.idx_slack, n, m
-    )
+    throw(ArgumentError("dictionary constructors were removed; construct ACPowerFlowState(ACNetwork(data), v)"))
 end
 
 """

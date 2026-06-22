@@ -36,13 +36,30 @@ Stores the DC network topology and parameters.
 | `gmax`, `gmin` | `Vector{Float64}` | Generator limits |
 | `angmax`, `angmin` | `Vector{Float64}` | Phase angle difference limits |
 | `cq`, `cl` | `Vector{Float64}` | Cost coefficients (quadratic, linear) |
-| `c_shed` | `Vector{Float64}` | Load-shedding cost per bus |
-| `ref_bus` | `Int` | Reference bus index (sequential) |
+| `c_shed` | `Vector{Float64}` | Load shedding cost per bus |
+| `demand` | `Vector{Float64}` | Real power demand aggregated per bus |
+| `pg_init` | `Vector{Float64}` | Initial real generation aggregated per bus |
+| `ref_bus` | `Int` | Preferred reference bus index (sequential) |
 | `tau` | `Float64` | Regularization parameter |
 | `id_map` | `IDMapping` | Bidirectional element ID mapping (original ↔ sequential) |
-| `ref` | `Union{Nothing,Dict}` | Stored `build_ref` result (nothing for programmatic constructors) |
+| `topology_cache` | `_DCTopologyCache` | Internal energized island cache (not part of the public API) |
 
-Construct from PowerModels data: `DCNetwork(net)` (accepts both basic and non-basic networks) or with explicit parameters: `DCNetwork(n, m, k, A, G_inc, b; ...)`.
+Construct from a parsed MATPOWER network with `DCNetwork(parse_file("case14.m"))`, or
+with explicit parameters: `DCNetwork(n, m, k, A, G_inc, b; ...)`.
+
+Use `reference_buses(net)` to obtain the effective reference set. The choice is
+deterministic: `ref_bus` is kept as the reference for its energized island, and
+every other island (including an isolated bus) uses its lowest sequential bus
+index.
+
+`DCNetwork` precomputes an internal energized topology cache and refreshes it
+when topology readers observe a direct `b` or `sw` change. This cache is not a
+thread safety mechanism. Sharing a `DCNetwork` across threads is supported only
+when topology fields are treated as read only; callers that mutate `b` or `sw`
+directly must serialize the mutation and the next topology dependent read. For
+`DCOPFProblem`, switch changes should go through [`update_switching!`](@ref), and
+topology changing susceptance edits require rebuilding the problem so the JuMP
+model and KKT layout keep the same reference constraints.
 
 ### ACNetwork
 
@@ -59,9 +76,7 @@ Stores the AC network with vectorized admittance representation.
 | `is_switchable` | `BitVector` | Which branches can be switched |
 | `idx_slack` | `Int` | Slack bus index (sequential) |
 | `vm_min`, `vm_max` | `Vector{Float64}` | Voltage magnitude limits per bus |
-| `i_max` | `Vector{Float64}` | Branch current magnitude limits |
 | `id_map` | `IDMapping` | Bidirectional element ID mapping (original ↔ sequential) |
-| `ref` | `Union{Nothing,Dict}` | Stored `build_ref` result (nothing for Y-matrix constructors) |
 
 ## Sensitivity Caching
 
@@ -75,7 +90,7 @@ The [`DCOPFProblem`](@ref) maintains a `DCSensitivityCache` that avoids redundan
 
 Calling `calc_sensitivity` with different operands for the same parameter reuses the cached KKT solve. For example, computing both `:va` and `:pg` w.r.t. `:d` only solves the KKT system once.
 
-Cache invalidation happens automatically when `solve!`, `update_demand!`, `update_switching!`, or `update_fmax!` is called.
+Cache invalidation happens automatically when `solve!`, `update_demand!`, `update_switching!`, or `update_fmax!` is called. Direct mutation of fields inside `prob.network` bypasses this contract.
 
 ### ACSensitivityCache
 
@@ -100,10 +115,13 @@ prob = DCOPFProblem(dc_net, d; optimizer=HiGHS.Optimizer)
 
 ### AC OPF
 
-Default solver is Ipopt. The `silent` keyword suppresses solver output:
+The default `:jump` backend uses Ipopt. The opt-in CPU `:exa` backend uses
+ExaModels and NLPModelsIpopt. Custom JuMP optimizer objects are accepted only
+by `:jump`.
 
 ```julia
 prob = ACOPFProblem(net; silent=true)
+exa_prob = ACOPFProblem(net; backend=:exa, silent=true)
 ```
 
 ## KKT System Access (Qualified)
@@ -124,7 +142,7 @@ idx = PD.kkt_indices(dc_net)           # Named index ranges
 
 # AC OPF — same unified API
 z = PD.flatten_variables(sol, ac_prob)
-J = PD.calc_kkt_jacobian(ac_prob)       # Dense Jacobian via ForwardDiff
+J = PD.calc_kkt_jacobian(ac_prob)       # Sparse analytical Jacobian
 dim = PD.kkt_dims(ac_prob)             # KKT dimension
 idx = PD.kkt_indices(ac_prob)          # Named index ranges
 ```

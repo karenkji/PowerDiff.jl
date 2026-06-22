@@ -167,7 +167,6 @@ Clear all cached AC sensitivity data. Called when problem parameters change.
 function invalidate!(cache::ACSensitivityCache)
     cache.solution = nothing
     cache.kkt_factor = nothing
-    cache.kkt_constants = nothing
     cache.dz_dsw = nothing
     cache.dz_dd = nothing
     cache.dz_dqd = nothing
@@ -177,44 +176,134 @@ function invalidate!(cache::ACSensitivityCache)
     return nothing
 end
 
-# =============================================================================
-# ACOPFProblem
-# =============================================================================
+abstract type AbstractACOPFBackend end
+struct JuMPBackend <: AbstractACOPFBackend end
+struct ExaBackend <: AbstractACOPFBackend end
+
+struct ACOPFData{C}
+    arcs::Vector{NTuple{3,Int}}
+    arc_from_idx::Vector{Int}
+    arc_to_idx::Vector{Int}
+    bus_arc_idxs::Vector{Vector{Int}}
+    bus_gen_idxs::Vector{Vector{Int}}
+    ref_bus_keys::Vector{Int}
+    constants::C
+end
+
+struct ACJuMPConstraints
+    ref_bus::Vector{ConstraintRef}
+    p_bal::Vector{ConstraintRef}
+    q_bal::Vector{ConstraintRef}
+    p_fr::Vector{ConstraintRef}
+    q_fr::Vector{ConstraintRef}
+    p_to::Vector{ConstraintRef}
+    q_to::Vector{ConstraintRef}
+    thermal_fr::Vector{ConstraintRef}
+    thermal_to::Vector{ConstraintRef}
+    angle_diff_lb::Vector{ConstraintRef}
+    angle_diff_ub::Vector{ConstraintRef}
+end
+
+struct ACExaConstraints{RB,PB,QB,PF,QF,PT,QT,TF,TT,AL,AU}
+    ref_bus::RB
+    p_bal::PB
+    q_bal::QB
+    p_fr::PF
+    q_fr::QF
+    p_to::PT
+    q_to::QT
+    thermal_fr::TF
+    thermal_to::TT
+    angle_diff_lb::AL
+    angle_diff_ub::AU
+end
+
+struct ACExaBusRecord
+    i::Int
+    pd::Float64
+    qd::Float64
+    gs::Float64
+    bs::Float64
+end
+
+struct ACExaGenRecord
+    i::Int
+    bus::Int
+    cost1::Float64
+    cost2::Float64
+    cost3::Float64
+end
+
+struct ACExaArcRecord
+    i::Int
+    bus::Int
+end
+
+struct ACExaBranchRecord
+    i::Int
+    f_idx::Int
+    t_idx::Int
+    f_bus::Int
+    t_bus::Int
+    c1::Float64
+    c2::Float64
+    c3::Float64
+    c4::Float64
+    c5::Float64
+    c6::Float64
+    c7::Float64
+    c8::Float64
+    sw::Float64
+    angmin_scaled::Float64
+    angmax_scaled::Float64
+    rate_a_sq::Float64
+end
+
+const _EXA_HAS_FUNCTIONAL_API = isdefined(ExaModels, :add_var)
+
+_exa_core(; backend=nothing) = _EXA_HAS_FUNCTIONAL_API ?
+    ExaModels.ExaCore(; backend=backend, concrete=Val(true)) :
+    ExaModels.ExaCore(; backend=backend)
+
+_exa_add_var(core, dims...; kwargs...) = _EXA_HAS_FUNCTIONAL_API ?
+    ExaModels.add_var(core, dims...; kwargs...) :
+    (core, ExaModels.variable(core, dims...; kwargs...))
+
+_exa_add_obj(core, expr; kwargs...) = _EXA_HAS_FUNCTIONAL_API ?
+    ExaModels.add_obj(core, expr; kwargs...) :
+    (core, ExaModels.objective(core, expr; kwargs...))
+
+_exa_add_con(core, expr; kwargs...) = _EXA_HAS_FUNCTIONAL_API ?
+    ExaModels.add_con(core, expr; kwargs...) :
+    (core, ExaModels.constraint(core, expr; kwargs...))
+
+_exa_add_con!(core, con, expr) = _EXA_HAS_FUNCTIONAL_API ?
+    ExaModels.add_con!(core, con, expr) :
+    (core, ExaModels.constraint!(core, con, expr))
+
+_exa_model(core; kwargs...) = ExaModels.ExaModel(core; kwargs...)
 
 """
     ACOPFProblem <: AbstractOPFProblem
 
-Polar coordinate AC OPF wrapped around a JuMP model.
-
-# Fields
-- `model`: JuMP Model
-- `network`: ACNetwork data
-- `va`, `vm`: Variable references for voltage angles and magnitudes
-- `pg`, `qg`: Variable references for active and reactive generation
-- `p`, `q`: Dict of branch flow variable references (keyed by arc tuple)
-- `cons`: Named tuple of constraint references
-- `ref`: PowerModels-style reference dictionary (sequential keys)
-- `gen_buses`: Generator bus indices (maps generator index to bus index)
-- `n_gen`: Number of generators
-- `cache`: ACSensitivityCache for caching KKT derivatives
-- `_optimizer`: Optimizer factory for model rebuilds (internal)
-- `_silent`: Whether to suppress solver output (internal)
+Polar coordinate AC OPF backed by either a JuMP model or an ExaModels model.
 """
-mutable struct ACOPFProblem <: AbstractOPFProblem
-    model::JuMP.Model
+mutable struct ACOPFProblem{B<:AbstractACOPFBackend,M,D,VA,VM,PG,QG,P,Q,C,O} <: AbstractOPFProblem
+    model::M
     network::ACNetwork
-    va::Vector{VariableRef}
-    vm::Vector{VariableRef}
-    pg::Vector{VariableRef}
-    qg::Vector{VariableRef}
-    p::Dict{Tuple{Int,Int,Int}, VariableRef}
-    q::Dict{Tuple{Int,Int,Int}, VariableRef}
-    cons::NamedTuple
-    ref::Dict{Symbol, Any}
+    data::D
+    va::VA
+    vm::VM
+    pg::PG
+    qg::QG
+    p::P
+    q::Q
+    cons::C
     gen_buses::Vector{Int}
     n_gen::Int
     cache::ACSensitivityCache
-    _optimizer::Any
+    _backend::B
+    _optimizer::O
     _silent::Bool
 end
 
@@ -225,306 +314,432 @@ end
 """
     ACOPFProblem(network::ACNetwork; optimizer=Ipopt.Optimizer, silent=true)
 
-Build a polar AC OPF problem from an ACNetwork that was constructed from a
-PowerModels dictionary (i.e., `network.ref` must not be nothing).
+Build a polar AC OPF problem from an ACNetwork.
 
 Accepts both basic and non-basic networks; internally remaps to sequential indices.
 
 # Arguments
-- `network`: ACNetwork containing topology, admittances, and stored `ref`
-- `optimizer`: JuMP-compatible optimizer (default: Ipopt)
+- `network`: ACNetwork containing topology, admittances, and typed branch/gen data
+- `backend`: `:jump` (default) or CPU `:exa`
+- `optimizer`: JuMP-compatible optimizer for `backend=:jump` (default: Ipopt)
 - `silent`: Suppress solver output (default: true)
 
 # Example
 ```julia
-pm_data = PowerModels.parse_file("case5.m")
-prob = ACOPFProblem(pm_data)
+data = parse_file("case5.m")
+prob = ACOPFProblem(data)
 solve!(prob)
 ```
 """
 function ACOPFProblem(
     network::ACNetwork;
+    backend::Symbol=:jump,
     optimizer=Ipopt.Optimizer,
     silent::Bool=true
 )
-    isnothing(network.ref) && error(
-        "ACOPFProblem requires an ACNetwork constructed from a PowerModels dict " *
-        "(network.ref must not be nothing). Use ACOPFProblem(pm_data::Dict) instead.")
-
-    id_map = network.id_map
-
-    # Remap ref to sequential keys so JuMP/KKT code can iterate 1:n, 1:m, 1:k
-    seq_ref = _remap_ref_to_sequential(network.ref, id_map)
-
-    n_gen = length(seq_ref[:gen])
-    gen_buses = [seq_ref[:gen][i]["gen_bus"] for i in 1:n_gen]
-
-    prob = ACOPFProblem(
-        JuMP.Model(), network,
-        VariableRef[], VariableRef[], VariableRef[], VariableRef[],
-        Dict{Tuple{Int,Int,Int}, VariableRef}(), Dict{Tuple{Int,Int,Int}, VariableRef}(),
-        (;), seq_ref, gen_buses, n_gen, ACSensitivityCache(), optimizer, silent
-    )
-    _rebuild_jump_model!(prob)
-    return prob
+    backend_tag = _ac_backend_tag(backend)
+    backend_tag isa ExaBackend && optimizer !== Ipopt.Optimizer && throw(ArgumentError(
+        "backend=:exa uses NLPModelsIpopt directly and does not accept a custom optimizer"))
+    _validate_acopf_network(network)
+    data = _build_acopf_data(network)
+    return _acopf_problem(network, data, backend_tag; optimizer=optimizer, silent=silent)
 end
 
-"""
-Remap element dict entries to sequential indices, updating bus ID fields.
-"""
-function _remap_element_dict(ref_dict, to_idx::Dict{Int,Int}, bus_to_idx::Dict{Int,Int}, bus_fields::Vector{String})
-    seq = Dict{Int, Any}()
-    for (orig_id, elem) in ref_dict
-        idx = to_idx[orig_id]
-        new_elem = deepcopy(elem)
-        new_elem["index"] = idx
-        for f in bus_fields
-            haskey(new_elem, f) && (new_elem[f] = bus_to_idx[new_elem[f]])
-        end
-        seq[idx] = new_elem
-    end
-    return seq
+function _ac_backend_tag(backend::Symbol)
+    backend == :jump && return JuMPBackend()
+    backend == :exa && return ExaBackend()
+    throw(ArgumentError("unsupported ACOPF backend :$backend (expected :jump or :exa)"))
 end
 
-"""
-Remap a `build_ref` result to sequential 1-based keys so that the JuMP model
-and KKT code can iterate `for i in 1:n` without change.
-"""
-function _remap_ref_to_sequential(ref::Dict, id_map::IDMapping)
-    seq_bus = _remap_element_dict(ref[:bus], id_map.bus_to_idx, id_map.bus_to_idx, ["bus_i"])
-    seq_branch = _remap_element_dict(ref[:branch], id_map.branch_to_idx, id_map.bus_to_idx, ["f_bus", "t_bus"])
-    seq_gen = _remap_element_dict(ref[:gen], id_map.gen_to_idx, id_map.bus_to_idx, ["gen_bus"])
-    seq_load = _remap_element_dict(ref[:load], id_map.load_to_idx, id_map.bus_to_idx, ["load_bus"])
-    seq_shunt = _remap_element_dict(ref[:shunt], id_map.shunt_to_idx, id_map.bus_to_idx, ["shunt_bus"])
-
-    # Remap arcs: (l, i, j) → (seq_l, seq_i, seq_j)
-    function _remap_arc(arc)
-        (l, i, j) = arc
-        return (id_map.branch_to_idx[l], id_map.bus_to_idx[i], id_map.bus_to_idx[j])
-    end
-
-    seq_arcs = [_remap_arc(a) for a in ref[:arcs]]
-    seq_arcs_from = [_remap_arc(a) for a in ref[:arcs_from]]
-    seq_arcs_to = [_remap_arc(a) for a in ref[:arcs_to]]
-
-    # Remap bus_arcs, bus_gens, bus_loads, bus_shunts to sequential bus keys
-    seq_bus_arcs = Dict{Int, Vector{Tuple{Int,Int,Int}}}()
-    for (orig_bus, arcs) in ref[:bus_arcs]
-        seq_bus_arcs[id_map.bus_to_idx[orig_bus]] = [_remap_arc(a) for a in arcs]
-    end
-
-    seq_bus_gens = Dict{Int, Vector{Int}}()
-    for (orig_bus, gen_ids) in ref[:bus_gens]
-        seq_bus_gens[id_map.bus_to_idx[orig_bus]] = [id_map.gen_to_idx[g] for g in gen_ids]
-    end
-
-    seq_bus_loads = Dict{Int, Vector{Int}}()
-    for (orig_bus, load_ids) in ref[:bus_loads]
-        seq_bus_loads[id_map.bus_to_idx[orig_bus]] = [id_map.load_to_idx[l] for l in load_ids]
-    end
-
-    seq_bus_shunts = Dict{Int, Vector{Int}}()
-    for (orig_bus, shunt_ids) in ref[:bus_shunts]
-        seq_bus_shunts[id_map.bus_to_idx[orig_bus]] = [id_map.shunt_to_idx[s] for s in shunt_ids]
-    end
-
-    # Remap ref_buses
-    seq_ref_buses = Dict{Int, Any}()
-    for (orig_bus, val) in ref[:ref_buses]
-        seq_ref_buses[id_map.bus_to_idx[orig_bus]] = val
-    end
-
-    return Dict{Symbol, Any}(
-        :bus => seq_bus,
-        :gen => seq_gen,
-        :branch => seq_branch,
-        :load => seq_load,
-        :shunt => seq_shunt,
-        :arcs => seq_arcs,
-        :arcs_from => seq_arcs_from,
-        :arcs_to => seq_arcs_to,
-        :bus_arcs => seq_bus_arcs,
-        :bus_gens => seq_bus_gens,
-        :bus_loads => seq_bus_loads,
-        :bus_shunts => seq_bus_shunts,
-        :ref_buses => seq_ref_buses,
-    )
+function _validate_acopf_network(network::ACNetwork)
+    isempty(network.gen_bus) && throw(ArgumentError(
+        "ACOPFProblem requires generator, cost, demand, voltage limit, and finite branch limit data; " *
+        "ACNetwork values built from a raw admittance matrix are power flow networks only"))
+    all(isfinite, network.rate_a) || throw(ArgumentError(
+        "ACOPFProblem requires finite branch rate_a limits"))
+    all(>(0), network.rate_a) || throw(ArgumentError(
+        "ACOPFProblem requires positive branch rate_a limits"))
+    return nothing
 end
 
-"""
-    _rebuild_jump_model!(prob::ACOPFProblem)
-
-Build (or rebuild) the JuMP model from current network parameters.
-Called by the constructor and by `update_switching!` after mutating `network.sw`.
-"""
-function _rebuild_jump_model!(prob::ACOPFProblem)
-    network = prob.network
-    ref = prob.ref
+function _build_acopf_data(network::ACNetwork)
     n, m = network.n, network.m
-    n_gen = prob.n_gen
+    k = length(network.gen_bus)
+    g_br = copy(network.g)
+    b_br = copy(network.b)
+    tr = network.tap .* cos.(network.shift)
+    ti = network.tap .* sin.(network.shift)
+    g_fr = copy(network.g_fr)
+    b_fr = copy(network.b_fr)
+    g_to = copy(network.g_to)
+    b_to = copy(network.b_to)
+    tm = copy(network.tm)
+    f_bus = copy(network.f_bus)
+    t_bus = copy(network.t_bus)
+    angmin = copy(network.angmin)
+    angmax = copy(network.angmax)
+    fmax = copy(network.rate_a)
+    arcs = Vector{NTuple{3,Int}}(undef, 2m)
+    arc_from_idx = Vector{Int}(undef, m)
+    arc_to_idx = Vector{Int}(undef, m)
+    bus_arc_idxs = [Int[] for _ in 1:n]
+
+    for l in 1:m
+        from_idx = 2l - 1
+        to_idx = 2l
+        arc_from_idx[l] = from_idx
+        arc_to_idx[l] = to_idx
+        arcs[from_idx] = (l, f_bus[l], t_bus[l])
+        arcs[to_idx] = (l, t_bus[l], f_bus[l])
+        push!(bus_arc_idxs[f_bus[l]], from_idx)
+        push!(bus_arc_idxs[t_bus[l]], to_idx)
+    end
+
+    vmin = copy(network.vm_min)
+    vmax = copy(network.vm_max)
+    gs = copy(network.gs)
+    bs = copy(network.bs)
+    pd = copy(network.pd)
+    qd = copy(network.qd)
+    ref_bus_keys = copy(network.ref_bus_keys)
+    pmin = copy(network.pmin)
+    pmax = copy(network.pmax)
+    qmin = copy(network.qmin)
+    qmax = copy(network.qmax)
+    gen_bus = copy(network.gen_bus)
+    cq = copy(network.cq)
+    cl = copy(network.cl)
+    cc = copy(network.cc)
+    bus_gen_idxs = [Int[] for _ in 1:n]
+
+    for i in 1:k
+        push!(bus_gen_idxs[gen_bus[i]], i)
+    end
+
+    constants = (
+        g_br = g_br, b_br = b_br, tr = tr, ti = ti,
+        g_fr = g_fr, b_fr = b_fr, g_to = g_to, b_to = b_to,
+        tm = tm, f_bus = f_bus, t_bus = t_bus,
+        angmin = angmin, angmax = angmax,
+        vmin = vmin, vmax = vmax,
+        pmin = pmin, pmax = pmax, qmin = qmin, qmax = qmax,
+        gen_bus = gen_bus, cq = cq, cl = cl, cc = cc,
+        fmax = fmax, gs = gs, bs = bs, pd = pd, qd = qd,
+        ref_bus_keys = ref_bus_keys,
+    )
+
+    return ACOPFData(arcs, arc_from_idx, arc_to_idx, bus_arc_idxs, bus_gen_idxs, ref_bus_keys, constants)
+end
+
+function _acopf_problem(network::ACNetwork, data::ACOPFData, ::JuMPBackend; optimizer, silent::Bool)
+    model, va, vm, pg, qg, p, q, cons = _build_jump_model(network, data, optimizer, silent)
+    cache = ACSensitivityCache()
+    cache.kkt_constants = data.constants
+    gen_buses = copy(data.constants.gen_bus)
+    return ACOPFProblem(model, network, data, va, vm, pg, qg, p, q, cons,
+        gen_buses, length(gen_buses), cache, JuMPBackend(), optimizer, silent)
+end
+
+function _acopf_problem(network::ACNetwork, data::ACOPFData, ::ExaBackend; optimizer, silent::Bool)
+    model, va, vm, pg, qg, p, q, cons = _build_examodel(network, data, optimizer, silent)
+    cache = ACSensitivityCache()
+    cache.kkt_constants = data.constants
+    gen_buses = copy(data.constants.gen_bus)
+    return ACOPFProblem(model, network, data, va, vm, pg, qg, p, q, cons,
+        gen_buses, length(gen_buses), cache, ExaBackend(), optimizer, silent)
+end
+
+function _rebuild_model!(prob::ACOPFProblem{JuMPBackend})
+    data = _build_acopf_data(prob.network)
+    model, va, vm, pg, qg, p, q, cons = _build_jump_model(prob.network, data, prob._optimizer, prob._silent)
+    prob.data = data
+    prob.model = model
+    prob.va = va
+    prob.vm = vm
+    prob.pg = pg
+    prob.qg = qg
+    prob.p = p
+    prob.q = q
+    prob.cons = cons
+    prob.gen_buses = copy(data.constants.gen_bus)
+    prob.n_gen = length(prob.gen_buses)
+    prob.cache.kkt_constants = data.constants
+    return nothing
+end
+
+function _rebuild_model!(prob::ACOPFProblem{ExaBackend})
+    data = _build_acopf_data(prob.network)
+    model, va, vm, pg, qg, p, q, cons = _build_examodel(prob.network, data, prob._optimizer, prob._silent)
+    prob.data = data
+    prob.model = model
+    prob.va = va
+    prob.vm = vm
+    prob.pg = pg
+    prob.qg = qg
+    prob.p = p
+    prob.q = q
+    prob.cons = cons
+    prob.gen_buses = copy(data.constants.gen_bus)
+    prob.n_gen = length(prob.gen_buses)
+    prob.cache.kkt_constants = data.constants
+    return nothing
+end
+
+function _build_jump_model(network::ACNetwork, data::ACOPFData, optimizer, silent::Bool)
+    constants = data.constants
+    n, m = network.n, network.m
+    n_gen = length(constants.gen_bus)
+    arc_fmax = [constants.fmax[arc[1]] for arc in data.arcs]
 
     # Create model
-    model = JuMP.Model(prob._optimizer)
-    prob._silent && set_silent(model)
+    model = JuMP.Model(optimizer)
+    silent && set_silent(model)
     set_optimizer_attribute(model, "tol", 1e-6)
 
     # Voltage variables
-    @variable(model, va[i in 1:n])
-    @variable(model, ref[:bus][i]["vmin"] <= vm[i in 1:n] <= ref[:bus][i]["vmax"], start=1.0)
+    @variable(model, va[1:n])
+    @variable(model, constants.vmin[i] <= vm[i in 1:n] <= constants.vmax[i], start=1.0)
 
     # Generation variables
-    @variable(model, ref[:gen][i]["pmin"] <= pg[i in 1:n_gen] <= ref[:gen][i]["pmax"])
-    @variable(model, ref[:gen][i]["qmin"] <= qg[i in 1:n_gen] <= ref[:gen][i]["qmax"])
+    @variable(model, constants.pmin[i] <= pg[i in 1:n_gen] <= constants.pmax[i])
+    @variable(model, constants.qmin[i] <= qg[i in 1:n_gen] <= constants.qmax[i])
 
     # Branch flow variables
-    p = Dict{Tuple{Int,Int,Int}, VariableRef}()
-    q = Dict{Tuple{Int,Int,Int}, VariableRef}()
-    for (l, i, j) in ref[:arcs]
-        p[(l,i,j)] = @variable(model, base_name="p[$l,$i,$j]")
-        q[(l,i,j)] = @variable(model, base_name="q[$l,$i,$j]")
-        set_lower_bound(p[(l,i,j)], -ref[:branch][l]["rate_a"])
-        set_upper_bound(p[(l,i,j)], ref[:branch][l]["rate_a"])
-        set_lower_bound(q[(l,i,j)], -ref[:branch][l]["rate_a"])
-        set_upper_bound(q[(l,i,j)], ref[:branch][l]["rate_a"])
-    end
+    @variable(model, -arc_fmax[i] <= p[i in 1:length(data.arcs)] <= arc_fmax[i])
+    @variable(model, -arc_fmax[i] <= q[i in 1:length(data.arcs)] <= arc_fmax[i])
 
     # Objective: minimize generation cost (quadratic)
     @objective(model, Min,
-        sum(gen["cost"][1]*pg[i]^2 + gen["cost"][2]*pg[i] + gen["cost"][3]
-            for (i, gen) in ref[:gen])
+        sum(constants.cq[i] * pg[i]^2 + constants.cl[i] * pg[i] + constants.cc[i] for i in 1:n_gen)
     )
 
     # Reference bus constraint
-    ref_bus_con = @constraint(model, [i in keys(ref[:ref_buses])], va[i] == 0)
+    ref_bus = [@constraint(model, va[i] == 0) for i in data.ref_bus_keys]
 
     # Nodal power balance constraints
-    p_bal_cons = Vector{ConstraintRef}(undef, n)
-    q_bal_cons = Vector{ConstraintRef}(undef, n)
-
-    for (i, bus) in ref[:bus]
-        bus_loads = [ref[:load][l] for l in ref[:bus_loads][i]]
-        bus_shunts = [ref[:shunt][s] for s in ref[:bus_shunts][i]]
-
+    p_bal = Vector{ConstraintRef}(undef, n)
+    q_bal = Vector{ConstraintRef}(undef, n)
+    for i in 1:n
         # Active power balance
-        p_bal_cons[i] = @constraint(model,
-            sum(p[a] for a in ref[:bus_arcs][i]) ==
-            sum(pg[g] for g in ref[:bus_gens][i]) -
-            sum(load["pd"] for load in bus_loads) -
-            sum(shunt["gs"] for shunt in bus_shunts) * vm[i]^2
+        p_bal[i] = @constraint(model,
+            sum(p[j] for j in data.bus_arc_idxs[i]) ==
+            sum(pg[g] for g in data.bus_gen_idxs[i]) - constants.pd[i] - constants.gs[i] * vm[i]^2
         )
 
         # Reactive power balance
-        q_bal_cons[i] = @constraint(model,
-            sum(q[a] for a in ref[:bus_arcs][i]) ==
-            sum(qg[g] for g in ref[:bus_gens][i]) -
-            sum(load["qd"] for load in bus_loads) +
-            sum(shunt["bs"] for shunt in bus_shunts) * vm[i]^2
+        q_bal[i] = @constraint(model,
+            sum(q[j] for j in data.bus_arc_idxs[i]) ==
+            sum(qg[g] for g in data.bus_gen_idxs[i]) - constants.qd[i] + constants.bs[i] * vm[i]^2
         )
     end
 
+    p_fr = Vector{ConstraintRef}(undef, m)
+    q_fr = Vector{ConstraintRef}(undef, m)
+    p_to = Vector{ConstraintRef}(undef, m)
+    q_to = Vector{ConstraintRef}(undef, m)
+    thermal_fr = Vector{ConstraintRef}(undef, m)
+    thermal_to = Vector{ConstraintRef}(undef, m)
+    angle_diff_lb = Vector{ConstraintRef}(undef, m)
+    angle_diff_ub = Vector{ConstraintRef}(undef, m)
+
     # Branch power flow constraints and thermal limits
-    p_fr_cons = Dict{Int, ConstraintRef}()
-    q_fr_cons = Dict{Int, ConstraintRef}()
-    p_to_cons = Dict{Int, ConstraintRef}()
-    q_to_cons = Dict{Int, ConstraintRef}()
-    thermal_fr_cons = Dict{Int, ConstraintRef}()
-    thermal_to_cons = Dict{Int, ConstraintRef}()
-    angle_diff_cons = Dict{Int, Vector{ConstraintRef}}()
-
-    for (l, branch) in ref[:branch]
-        f_idx = (l, branch["f_bus"], branch["t_bus"])
-        t_idx = (l, branch["t_bus"], branch["f_bus"])
-
-        p_fr = p[f_idx]
-        q_fr = q[f_idx]
-        p_to = p[t_idx]
-        q_to = q[t_idx]
-
-        vm_fr = vm[branch["f_bus"]]
-        vm_to = vm[branch["t_bus"]]
-        va_fr = va[branch["f_bus"]]
-        va_to = va[branch["t_bus"]]
-
-        # Branch parameters (incorporating switching state sw)
-        g_br, b_br = PM.calc_branch_y(branch)
-        tr, ti = PM.calc_branch_t(branch)
-        g_fr_shunt = branch["g_fr"]
-        b_fr_shunt = branch["b_fr"]
-        g_to_shunt = branch["g_to"]
-        b_to_shunt = branch["b_to"]
-        tm = branch["tap"]^2
-
-        # Scale by switching state
+    for l in 1:m
+        f_idx = data.arc_from_idx[l]
+        t_idx = data.arc_to_idx[l]
+        fb = constants.f_bus[l]
+        tb = constants.t_bus[l]
         sw_l = network.sw[l]
 
         # AC Power Flow Constraints (from side)
-        p_fr_cons[l] = @constraint(model,
-            p_fr == sw_l * ((g_br + g_fr_shunt)/tm * vm_fr^2 +
-                    (-g_br*tr + b_br*ti)/tm * (vm_fr * vm_to * cos(va_fr - va_to)) +
-                    (-b_br*tr - g_br*ti)/tm * (vm_fr * vm_to * sin(va_fr - va_to)))
+        p_fr[l] = @constraint(model,
+            p[f_idx] == sw_l * ((constants.g_br[l] + constants.g_fr[l]) / constants.tm[l] * vm[fb]^2 +
+                (-constants.g_br[l] * constants.tr[l] + constants.b_br[l] * constants.ti[l]) / constants.tm[l] *
+                (vm[fb] * vm[tb] * cos(va[fb] - va[tb])) +
+                (-constants.b_br[l] * constants.tr[l] - constants.g_br[l] * constants.ti[l]) / constants.tm[l] *
+                (vm[fb] * vm[tb] * sin(va[fb] - va[tb])))
         )
 
-        q_fr_cons[l] = @constraint(model,
-            q_fr == sw_l * (-(b_br + b_fr_shunt)/tm * vm_fr^2 -
-                    (-b_br*tr - g_br*ti)/tm * (vm_fr * vm_to * cos(va_fr - va_to)) +
-                    (-g_br*tr + b_br*ti)/tm * (vm_fr * vm_to * sin(va_fr - va_to)))
+        q_fr[l] = @constraint(model,
+            q[f_idx] == sw_l * (-(constants.b_br[l] + constants.b_fr[l]) / constants.tm[l] * vm[fb]^2 -
+                (-constants.b_br[l] * constants.tr[l] - constants.g_br[l] * constants.ti[l]) / constants.tm[l] *
+                (vm[fb] * vm[tb] * cos(va[fb] - va[tb])) +
+                (-constants.g_br[l] * constants.tr[l] + constants.b_br[l] * constants.ti[l]) / constants.tm[l] *
+                (vm[fb] * vm[tb] * sin(va[fb] - va[tb])))
         )
 
         # AC Power Flow Constraints (to side)
-        p_to_cons[l] = @constraint(model,
-            p_to == sw_l * ((g_br + g_to_shunt) * vm_to^2 +
-                    (-g_br*tr - b_br*ti)/tm * (vm_to * vm_fr * cos(va_to - va_fr)) +
-                    (-b_br*tr + g_br*ti)/tm * (vm_to * vm_fr * sin(va_to - va_fr)))
+        p_to[l] = @constraint(model,
+            p[t_idx] == sw_l * ((constants.g_br[l] + constants.g_to[l]) * vm[tb]^2 +
+                (-constants.g_br[l] * constants.tr[l] - constants.b_br[l] * constants.ti[l]) / constants.tm[l] *
+                (vm[tb] * vm[fb] * cos(va[tb] - va[fb])) +
+                (-constants.b_br[l] * constants.tr[l] + constants.g_br[l] * constants.ti[l]) / constants.tm[l] *
+                (vm[tb] * vm[fb] * sin(va[tb] - va[fb])))
         )
 
-        q_to_cons[l] = @constraint(model,
-            q_to == sw_l * (-(b_br + b_to_shunt) * vm_to^2 -
-                    (-b_br*tr + g_br*ti)/tm * (vm_to * vm_fr * cos(va_fr - va_to)) +
-                    (-g_br*tr - b_br*ti)/tm * (vm_to * vm_fr * sin(va_to - va_fr)))
+        q_to[l] = @constraint(model,
+            q[t_idx] == sw_l * (-(constants.b_br[l] + constants.b_to[l]) * vm[tb]^2 -
+                (-constants.b_br[l] * constants.tr[l] + constants.g_br[l] * constants.ti[l]) / constants.tm[l] *
+                (vm[tb] * vm[fb] * cos(va[fb] - va[tb])) +
+                (-constants.g_br[l] * constants.tr[l] - constants.b_br[l] * constants.ti[l]) / constants.tm[l] *
+                (vm[tb] * vm[fb] * sin(va[tb] - va[fb])))
         )
 
         # Angle difference limits
-        angle_diff_cons[l] = [
-            @constraint(model, sw_l * (va_fr - va_to) >= sw_l * branch["angmin"]),
-            @constraint(model, sw_l * (va_fr - va_to) <= sw_l * branch["angmax"])
-        ]
+        angle_diff_lb[l] = @constraint(model, sw_l * (va[fb] - va[tb]) >= sw_l * constants.angmin[l])
+        angle_diff_ub[l] = @constraint(model, sw_l * (va[fb] - va[tb]) <= sw_l * constants.angmax[l])
 
         # Thermal limits (apparent power)
-        thermal_fr_cons[l] = @constraint(model, p_fr^2 + q_fr^2 <= branch["rate_a"]^2)
-        thermal_to_cons[l] = @constraint(model, p_to^2 + q_to^2 <= branch["rate_a"]^2)
+        thermal_fr[l] = @constraint(model, p[f_idx]^2 + q[f_idx]^2 <= constants.fmax[l]^2)
+        thermal_to[l] = @constraint(model, p[t_idx]^2 + q[t_idx]^2 <= constants.fmax[l]^2)
     end
 
-    prob.model = model
-    prob.va = collect(va)
-    prob.vm = collect(vm)
-    prob.pg = collect(pg)
-    prob.qg = collect(qg)
-    prob.p = p
-    prob.q = q
-    prob.cons = (
-        ref_bus = ref_bus_con,
-        p_bal = p_bal_cons,
-        q_bal = q_bal_cons,
-        p_fr = p_fr_cons,
-        q_fr = q_fr_cons,
-        p_to = p_to_cons,
-        q_to = q_to_cons,
-        thermal_fr = thermal_fr_cons,
-        thermal_to = thermal_to_cons,
-        angle_diff = angle_diff_cons
-    )
+    cons = ACJuMPConstraints(ref_bus, p_bal, q_bal, p_fr, q_fr, p_to, q_to,
+        thermal_fr, thermal_to, angle_diff_lb, angle_diff_ub)
+    return model, collect(va), collect(vm), collect(pg), collect(qg), collect(p), collect(q), cons
+end
 
-    return nothing
+function _build_ac_exa_records(network::ACNetwork, data::ACOPFData)
+    constants = data.constants
+    n, m = network.n, network.m
+    k = length(constants.gen_bus)
+
+    bus = Vector{ACExaBusRecord}(undef, n)
+    for i in 1:n
+        bus[i] = ACExaBusRecord(i, constants.pd[i], constants.qd[i], constants.gs[i], constants.bs[i])
+    end
+
+    gen = Vector{ACExaGenRecord}(undef, k)
+    for i in 1:k
+        gen[i] = ACExaGenRecord(i, constants.gen_bus[i], constants.cq[i], constants.cl[i], constants.cc[i])
+    end
+
+    arc = Vector{ACExaArcRecord}(undef, length(data.arcs))
+    for i in eachindex(data.arcs)
+        arc[i] = ACExaArcRecord(i, data.arcs[i][2])
+    end
+
+    branch = Vector{ACExaBranchRecord}(undef, m)
+    for l in 1:m
+        sw = network.sw[l]
+        inv_tm = 1.0 / constants.tm[l]
+        c1 = sw * ((-constants.g_br[l] * constants.tr[l] - constants.b_br[l] * constants.ti[l]) * inv_tm)
+        c2 = sw * ((-constants.b_br[l] * constants.tr[l] + constants.g_br[l] * constants.ti[l]) * inv_tm)
+        c3 = sw * ((-constants.g_br[l] * constants.tr[l] + constants.b_br[l] * constants.ti[l]) * inv_tm)
+        c4 = sw * ((-constants.b_br[l] * constants.tr[l] - constants.g_br[l] * constants.ti[l]) * inv_tm)
+        c5 = sw * ((constants.g_br[l] + constants.g_fr[l]) * inv_tm)
+        c6 = sw * ((constants.b_br[l] + constants.b_fr[l]) * inv_tm)
+        c7 = sw * (constants.g_br[l] + constants.g_to[l])
+        c8 = sw * (constants.b_br[l] + constants.b_to[l])
+        branch[l] = ACExaBranchRecord(
+            l,
+            data.arc_from_idx[l],
+            data.arc_to_idx[l],
+            constants.f_bus[l],
+            constants.t_bus[l],
+            c1,
+            c2,
+            c3,
+            c4,
+            c5,
+            c6,
+            c7,
+            c8,
+            sw,
+            sw * constants.angmin[l],
+            sw * constants.angmax[l],
+            constants.fmax[l]^2,
+        )
+    end
+
+    return (
+        bus = bus,
+        gen = gen,
+        arc = arc,
+        branch = branch,
+        ref_bus_keys = copy(data.ref_bus_keys),
+        nonpositive_lcon = fill(-Inf, m),
+        nonpositive_ucon = zeros(m),
+    )
+end
+
+function _build_examodel(network::ACNetwork, data::ACOPFData, optimizer, silent::Bool)
+    constants = data.constants
+    n = network.n
+    n_gen = length(constants.gen_bus)
+    arc_fmax = [constants.fmax[arc[1]] for arc in data.arcs]
+    exa = _build_ac_exa_records(network, data)
+
+    core = _exa_core()
+    core, va = _exa_add_var(core, n)
+    core, vm = _exa_add_var(core, n; start=ones(n), lvar=constants.vmin, uvar=constants.vmax)
+    core, pg = _exa_add_var(core, n_gen; lvar=constants.pmin, uvar=constants.pmax)
+    core, qg = _exa_add_var(core, n_gen; lvar=constants.qmin, uvar=constants.qmax)
+    core, p = _exa_add_var(core, length(data.arcs); lvar=-arc_fmax, uvar=arc_fmax)
+    core, q = _exa_add_var(core, length(data.arcs); lvar=-arc_fmax, uvar=arc_fmax)
+
+    core, _ = _exa_add_obj(core,
+        g.cost1 * pg[g.i]^2 + g.cost2 * pg[g.i] + g.cost3 for g in exa.gen)
+
+    core, ref_bus = _exa_add_con(core, va[i] for i in exa.ref_bus_keys)
+    core, p_fr = _exa_add_con(core,
+        p[b.f_idx] - b.c5 * vm[b.f_bus]^2 -
+        b.c3 * (vm[b.f_bus] * vm[b.t_bus] * cos(va[b.f_bus] - va[b.t_bus])) -
+        b.c4 * (vm[b.f_bus] * vm[b.t_bus] * sin(va[b.f_bus] - va[b.t_bus]))
+        for b in exa.branch)
+    core, q_fr = _exa_add_con(core,
+        q[b.f_idx] + b.c6 * vm[b.f_bus]^2 +
+        b.c4 * (vm[b.f_bus] * vm[b.t_bus] * cos(va[b.f_bus] - va[b.t_bus])) -
+        b.c3 * (vm[b.f_bus] * vm[b.t_bus] * sin(va[b.f_bus] - va[b.t_bus]))
+        for b in exa.branch)
+    core, p_to = _exa_add_con(core,
+        p[b.t_idx] - b.c7 * vm[b.t_bus]^2 -
+        b.c1 * (vm[b.t_bus] * vm[b.f_bus] * cos(va[b.t_bus] - va[b.f_bus])) -
+        b.c2 * (vm[b.t_bus] * vm[b.f_bus] * sin(va[b.t_bus] - va[b.f_bus]))
+        for b in exa.branch)
+    core, q_to = _exa_add_con(core,
+        q[b.t_idx] + b.c8 * vm[b.t_bus]^2 +
+        b.c2 * (vm[b.t_bus] * vm[b.f_bus] * cos(va[b.t_bus] - va[b.f_bus])) -
+        b.c1 * (vm[b.t_bus] * vm[b.f_bus] * sin(va[b.t_bus] - va[b.f_bus]))
+        for b in exa.branch)
+    core, angle_diff_lb = _exa_add_con(core,
+        b.angmin_scaled - b.sw * va[b.f_bus] + b.sw * va[b.t_bus] for b in exa.branch;
+        lcon=exa.nonpositive_lcon, ucon=exa.nonpositive_ucon)
+    core, angle_diff_ub = _exa_add_con(core,
+        b.sw * va[b.f_bus] - b.sw * va[b.t_bus] - b.angmax_scaled for b in exa.branch;
+        lcon=exa.nonpositive_lcon, ucon=exa.nonpositive_ucon)
+    core, thermal_fr = _exa_add_con(core,
+        p[b.f_idx]^2 + q[b.f_idx]^2 - b.rate_a_sq for b in exa.branch;
+        lcon=exa.nonpositive_lcon, ucon=exa.nonpositive_ucon)
+    core, thermal_to = _exa_add_con(core,
+        p[b.t_idx]^2 + q[b.t_idx]^2 - b.rate_a_sq for b in exa.branch;
+        lcon=exa.nonpositive_lcon, ucon=exa.nonpositive_ucon)
+
+    core, p_bal = _exa_add_con(core,
+        b.pd + b.gs * vm[b.i]^2 for b in exa.bus)
+    core, _ = _exa_add_con!(core, p_bal, a.bus => p[a.i] for a in exa.arc)
+    core, _ = _exa_add_con!(core, p_bal, g.bus => -pg[g.i] for g in exa.gen)
+
+    core, q_bal = _exa_add_con(core,
+        b.qd - b.bs * vm[b.i]^2 for b in exa.bus)
+    core, _ = _exa_add_con!(core, q_bal, a.bus => q[a.i] for a in exa.arc)
+    core, _ = _exa_add_con!(core, q_bal, g.bus => -qg[g.i] for g in exa.gen)
+
+    model = _exa_model(core)
+    cons = ACExaConstraints(ref_bus, p_bal, q_bal, p_fr, q_fr, p_to, q_to,
+        thermal_fr, thermal_to, angle_diff_lb, angle_diff_ub)
+    return model, va, vm, pg, qg, p, q, cons
 end
 
 """
     ACOPFProblem(pm_data::Dict; kwargs...)
 
-Convenience constructor: build ACOPFProblem directly from PowerModels dict.
+Reject the removed dictionary API with a migration hint.
 
 Accepts both basic and non-basic networks.
 """
 function ACOPFProblem(pm_data::Dict; kwargs...)
-    network = ACNetwork(pm_data)
-    return ACOPFProblem(network; kwargs...)
+    throw(ArgumentError("dictionary constructors were removed; parse a network file with PowerDiff.parse_file"))
 end
+
+ACOPFProblem(net::PowerIO.Network; kwargs...) = ACOPFProblem(ACNetwork(net); kwargs...)
+ACOPFProblem(data::NamedTuple; kwargs...) = ACOPFProblem(ACNetwork(data); kwargs...)

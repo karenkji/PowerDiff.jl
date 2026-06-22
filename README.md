@@ -21,7 +21,7 @@ A Julia package for differentiable power system analysis. Compute sensitivities 
 
 ## Installation
 
-> Requires Julia 1.9 or later.
+> Requires Julia 1.10 or later.
 
 ```julia
 using Pkg
@@ -31,9 +31,9 @@ Pkg.add(url="https://github.com/grid-opt-alg-lab/PowerDiff.jl.git")
 ## Quick Start
 
 ```julia
-using PowerDiff, PowerModels
+using PowerDiff
 
-# Load network (make_basic_network is optional)
+# Parse a supported PowerIO case into a PowerIO.Network
 net = parse_file("case14.m")
 dc_net = DCNetwork(net)
 d = calc_demand_vector(net)
@@ -59,12 +59,18 @@ See the [Getting Started guide](https://samueltalkington.com/research/powerdiff/
 - [Advanced Topics](https://samueltalkington.com/research/powerdiff/advanced/) — Type hierarchy, caching, solver configuration
 - [API Reference](https://samueltalkington.com/research/powerdiff/api/) — Full docstring reference
 
+## Input Format
+
+PowerDiff reads files through PowerIO. `parse_file` supports MATPOWER `.m`,
+PSS/E `.raw`, PowerWorld `.aux`, PowerModels JSON, and Egret JSON. For streams,
+pass `from`; JSON streams need `from=:egret` or `from=:powermodels`.
+
 ## Dependencies
 
-- [PowerModels.jl](https://github.com/lanl-ansi/PowerModels.jl) — Power system modeling
+- [PowerIO.jl](https://github.com/eigenergy/PowerIO.jl) — Parser and data layer (see `docs/powerio-integration.md`)
 - [JuMP.jl](https://github.com/jump-dev/JuMP.jl) — Optimization modeling
+- [ExaModels.jl](https://github.com/exanauts/ExaModels.jl) — Alternative optimization modeling for GPU parallelization
 - [Ipopt.jl](https://github.com/jump-dev/Ipopt.jl) — Default solver for DC and AC OPF
-- [ForwardDiff.jl](https://github.com/JuliaDiff/ForwardDiff.jl) — Automatic differentiation
 
 ## License
 

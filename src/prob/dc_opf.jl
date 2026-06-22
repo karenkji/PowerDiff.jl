@@ -28,11 +28,11 @@ const COMPLEMENTARITY_SNAP_TOL = 1e-6
 
 Check JuMP model termination status and throw informative errors for common failure modes.
 """
-function _check_solve_status(model, label::String)
+function _check_solve_status(model::JuMP.Model, label::String)
     status = termination_status(model)
     status in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED) && return status
     if status == MOI.ALMOST_LOCALLY_SOLVED
-        @warn "$label converged at acceptable tolerance (ALMOST_LOCALLY_SOLVED)"
+        _SILENCE_WARNINGS[] || @warn "$label converged at acceptable tolerance (ALMOST_LOCALLY_SOLVED)"
         return status
     end
     if status == MOI.INFEASIBLE
@@ -47,14 +47,15 @@ function _check_solve_status(model, label::String)
 end
 
 """
-    _warn_negative_demand(d)
+    _debug_negative_demand(d)
 
-Warn if any demand entries are negative, which makes shedding bounds infeasible.
+Log if any demand entries are negative. Negative net demand is retained in
+power balance, while load shedding is disabled at those buses.
 """
-function _warn_negative_demand(d)
+function _debug_negative_demand(d)
     neg_buses = findall(d .< 0)
     if !isempty(neg_buses)
-        _SILENCE_WARNINGS[] || @warn "Negative demand at buses $neg_buses; shedding bounds 0 ≤ psh ≤ d will be infeasible at those buses"
+        @debug "Negative demand treated as net injection with psh fixed at zero" buses=neg_buses
     end
 end
 
@@ -95,6 +96,8 @@ function solve!(prob::DCOPFProblem)
     μ_ub = -dual.(prob.cons.shed_ub)
     γ_lb = dual.(prob.cons.phase_diff_lb)
     γ_ub = -dual.(prob.cons.phase_diff_ub)
+    refs = reference_buses(prob.network)
+    η_ref = [dual(prob.cons.ref[i]) for i in refs]
 
     # Post-process phase angle difference duals for strict complementarity.
     # Interior point solvers leave gamma ≈ 1e-8 for non binding constraints.
@@ -119,10 +122,8 @@ function solve!(prob::DCOPFProblem)
     # Snap to strict complementarity for clean KKT sensitivity computation.
     d = prob.d
     for i in eachindex(psh_val)
-        if d[i] < -TOL
-            _SILENCE_WARNINGS[] || @warn "Negative demand at bus $i (d=$(d[i])); psh snap may be unreliable"
-        end
-        if abs(d[i]) < TOL
+        shed_capacity = _shed_capacity(d[i])
+        if shed_capacity < TOL
             # Degenerate: both bounds collapse to 0 ≤ psh ≤ 0
             psh_val[i] = 0.0
             # Canonicalize the duplicate dual pair so the sensitivity KKT sees
@@ -133,9 +134,9 @@ function solve!(prob::DCOPFProblem)
             # Lower bound active: psh = 0
             psh_val[i] = 0.0
             μ_ub[i] = 0.0
-        elseif d[i] - psh_val[i] < TOL
-            # Upper bound active: psh = d
-            psh_val[i] = d[i]
+        elseif shed_capacity - psh_val[i] < TOL
+            # Upper bound active: psh = max(d, 0)
+            psh_val[i] = shed_capacity
             μ_lb[i] = 0.0
         else
             # Strictly interior: both bounds inactive
@@ -152,7 +153,7 @@ function solve!(prob::DCOPFProblem)
     end
     B_r_factor = prob.cache.b_r_factor
 
-    sol = DCOPFSolution(θ_val, g_val, f_val, psh_val, ν_bal, ν_flow, λ_ub, λ_lb, ρ_ub, ρ_lb, μ_lb, μ_ub, γ_lb, γ_ub, obj, B_r_factor)
+    sol = DCOPFSolution(θ_val, g_val, f_val, psh_val, ν_bal, ν_flow, λ_ub, λ_lb, ρ_ub, ρ_lb, μ_lb, μ_ub, γ_lb, γ_ub, η_ref, obj, B_r_factor)
 
     # Cache the solution for sensitivity computations
     prob.cache.solution = sol
@@ -165,7 +166,8 @@ end
 
 Rewrite the RHS of the power balance and shedding upper bound constraints to
 the new demand `d`, mutate `prob.d` in place, and invalidate the sensitivity
-cache. Avoids rebuilding the JuMP model.
+cache. The shedding upper bound is `max(d, 0)` because negative net demand is
+an injection rather than curtailable load. Avoids rebuilding the JuMP model.
 
 To keep the JuMP constraints and the sensitivity cache consistent with the
 stored demand, always go through this function — do not mutate `prob.d` in
@@ -175,13 +177,13 @@ function update_demand!(prob::DCOPFProblem, d::AbstractVector)
     n = prob.network.n
     length(d) == n || throw(DimensionMismatch("Demand vector length $(length(d)) must match number of buses $n"))
 
-    _warn_negative_demand(d)
+    _debug_negative_demand(d)
 
     invalidate!(prob.cache)
     prob.d .= d
     for i in 1:n
         set_normalized_rhs(prob.cons.power_bal[i], d[i])
-        set_normalized_rhs(prob.cons.shed_ub[i], d[i])
+        set_normalized_rhs(prob.cons.shed_ub[i], _shed_capacity(d[i]))
     end
 
     return prob
